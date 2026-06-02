@@ -1,0 +1,30 @@
+[project]
+name = "mtf-mapper-python"
+version = "0.1.0"
+description = "Standalone Python core analyzer inspired by MTF Mapper"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "scipy",
+]
+
+[project.scripts]
+mtf-mapper-py = "mtf_mapper_py:main"
+mtf-mapper-gui = "mtf_mapper_gui:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["mtf_mapper_py", "mtf_mapper_gui"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
