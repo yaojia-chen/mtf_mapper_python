@@ -92,6 +92,25 @@ class MtfMapperPyTests(unittest.TestCase):
         )
         self.assertEqual(mtf_mapper_gui.preview_to_image_coords(15, 20, state), (20, 20))
 
+    def test_gui_measurement_summary(self):
+        measurements = [
+            mtf_mapper_py.EdgeMeasurement(
+                1, 10.0, 10.0, 0.2, "mtf_ny4", "mtf_ny4", 0.0, 0.0, 4.0, 0.0, np.array([1.0]), 0.8
+            ),
+            mtf_mapper_py.EdgeMeasurement(
+                1, 20.0, 10.0, 0.4, "mtf_ny4", "mtf_ny4", 0.0, 0.0, 4.0, 0.0, np.array([1.0]), 0.8
+            ),
+            mtf_mapper_py.EdgeMeasurement(
+                2, 30.0, 10.0, 0.9, "mtf_ny4", "mtf_ny4", 0.0, 0.0, 4.0, 0.0, np.array([1.0]), 0.8
+            ),
+        ]
+        summary = mtf_mapper_gui.summarize_measurements(measurements)
+        self.assertEqual(summary["edges"], 3)
+        self.assertEqual(summary["blocks"], 2)
+        self.assertAlmostEqual(summary["median"], 0.4)
+        self.assertAlmostEqual(summary["minimum"], 0.2)
+        self.assertAlmostEqual(summary["maximum"], 0.9)
+
     def test_load_raw_image_with_header_and_byte_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_path = Path(tmp) / "tiny.raw"

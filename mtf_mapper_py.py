@@ -36,6 +36,7 @@ MTF_FIXED_FREQUENCIES = {
     "mtf_ny2": MTF_NYQUIST_CP / 2.0,
     "mtf_ny4": MTF_NYQUIST_CP / 4.0,
 }
+ANNOTATION_COLOR_BGR = (255, 0, 255)
 
 
 @dataclass
@@ -506,7 +507,7 @@ def make_annotation(lum: np.ndarray, original: np.ndarray, measurements: Sequenc
         base = display_copy(original[:, :, :3])
         annotated = base.copy()
     for m in measurements:
-        color = (0, 0, 255)
+        color = ANNOTATION_COLOR_BGR
         if not math.isfinite(m.mtf_value):
             label = "N/A"
         else:
@@ -516,9 +517,9 @@ def make_annotation(lum: np.ndarray, original: np.ndarray, measurements: Sequenc
         cv2.circle(annotated, pos, 4, (0, 0, 0), -1, cv2.LINE_AA)
         cv2.circle(annotated, pos, 3, color, -1, cv2.LINE_AA)
         text_pos = (pos[0] + 6, pos[1] - 6)
-        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 5, cv2.LINE_AA)
-        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
+        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 6, cv2.LINE_AA)
+        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
     return annotated
 
 

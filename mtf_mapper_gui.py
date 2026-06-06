@@ -64,6 +64,19 @@ class SfrPlotState:
     max_frequency: float
 
 
+def summarize_measurements(measurements: list[mtf_mapper_py.EdgeMeasurement]) -> dict[str, float | int]:
+    if not measurements:
+        return {"edges": 0, "blocks": 0, "median": 0.0, "minimum": 0.0, "maximum": 0.0}
+    values = np.array([measurement.mtf_value for measurement in measurements], dtype=float)
+    return {
+        "edges": len(measurements),
+        "blocks": len({measurement.block_id for measurement in measurements}),
+        "median": float(np.median(values)),
+        "minimum": float(np.min(values)),
+        "maximum": float(np.max(values)),
+    }
+
+
 def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[str, object]) -> argparse.Namespace:
     raw_enabled = bool(values.get("raw", False))
     args = argparse.Namespace(
@@ -251,6 +264,7 @@ class MtfMapperGui(tk.Tk):
         self.current_output_root = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui"
 
         self._build_vars()
+        self._configure_style()
         self._build_menu()
         self._build_layout()
         self._update_raw_controls()
@@ -278,8 +292,24 @@ class MtfMapperGui(tk.Tk):
         self.raw_header = IntVar(value=0)
         self.raw_channels = IntVar(value=1)
         self.status = StringVar(value="Ready")
+        self.summary_title = StringVar(value="No analysis yet")
+        self.summary_detail = StringVar(value="Open an image or try the sample chart to see a measurement summary.")
+        self.summary_edges = StringVar(value="-")
+        self.summary_blocks = StringVar(value="-")
+        self.summary_median = StringVar(value="-")
+        self.summary_range = StringVar(value="-")
+        self.preview_info = StringVar(value="No image")
         self.selected_edge = StringVar(value="No edge selected")
         self.raw.trace_add("write", lambda *_args: self._update_raw_controls())
+
+    def _configure_style(self) -> None:
+        style = ttk.Style(self)
+        if "aqua" in style.theme_names():
+            style.theme_use("aqua")
+        style.configure("Muted.TLabel", foreground="#5f6b7a")
+        style.configure("SummaryTitle.TLabel", font=("TkDefaultFont", 13, "bold"))
+        style.configure("StatValue.TLabel", font=("TkDefaultFont", 14, "bold"))
+        style.configure("Primary.TButton", font=("TkDefaultFont", 11, "bold"))
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self)
@@ -304,7 +334,7 @@ class MtfMapperGui(tk.Tk):
         self._build_toolbar()
 
         root = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        root.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
 
         sidebar = ttk.Frame(root, width=280)
         workspace = ttk.PanedWindow(root, orient=tk.VERTICAL)
@@ -314,20 +344,21 @@ class MtfMapperGui(tk.Tk):
         self._build_settings_sidebar(sidebar)
         self._build_image_panel(workspace)
         self._build_bottom_tabs(workspace)
-        ttk.Label(self, textvariable=self.status, anchor=tk.W).pack(fill=tk.X, padx=8, pady=(0, 6))
+        status_bar = ttk.Frame(self)
+        status_bar.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Label(status_bar, textvariable=self.status, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=140)
+        self.progress.pack(side=tk.RIGHT)
 
     def _build_toolbar(self) -> None:
         toolbar = ttk.Frame(self)
-        toolbar.pack(fill=tk.X, padx=8, pady=8)
+        toolbar.pack(fill=tk.X, padx=10, pady=(10, 8))
         ttk.Button(toolbar, text="Open", command=self.open_files).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Open sample", command=self.open_sample).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(toolbar, text="Try sample", command=self.open_sample).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(toolbar, text="Output folder", command=self.choose_output_dir).pack(side=tk.LEFT, padx=(6, 0))
-        self.run_button = ttk.Button(toolbar, text="Run analysis", command=self.run_analysis)
-        self.run_button.pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(toolbar, text="Clear results", command=self.clear_results).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(toolbar, text="Metric").pack(side=tk.LEFT, padx=(18, 4))
-        ttk.Combobox(toolbar, textvariable=self.mtf_metric, values=("mtf_ny2", "mtf_ny4", "mtf50"), state="readonly", width=10).pack(side=tk.LEFT)
-        ttk.Label(toolbar, textvariable=self.status, anchor=tk.E).pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        ttk.Button(toolbar, text="Clear", command=self.clear_results).pack(side=tk.RIGHT)
+        self.run_button = ttk.Button(toolbar, text="Run analysis", command=self.run_analysis, style="Primary.TButton")
+        self.run_button.pack(side=tk.RIGHT, padx=(0, 8))
 
     def _build_image_panel(self, parent: ttk.PanedWindow) -> None:
         preview_frame = ttk.LabelFrame(parent, text="Image preview")
@@ -337,11 +368,16 @@ class MtfMapperGui(tk.Tk):
         ttk.Button(controls, text="Zoom +", command=lambda: self.zoom_preview(1.25)).pack(side=tk.LEFT)
         ttk.Button(controls, text="Zoom -", command=lambda: self.zoom_preview(0.8)).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(controls, text="Fit", command=self.fit_preview).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(controls, text="Drag to pan. Click near an edge for SFR.", anchor=tk.E).pack(side=tk.RIGHT)
+        ttk.Label(controls, textvariable=self.preview_info, style="Muted.TLabel", anchor=tk.E).pack(side=tk.RIGHT)
 
         canvas_frame = ttk.Frame(preview_frame)
         canvas_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self.preview = tk.Canvas(canvas_frame, background="#f5f5f5", highlightthickness=1, highlightbackground="#c8c8c8")
+        self.preview = tk.Canvas(
+            canvas_frame,
+            background="#dfe3e8",
+            highlightthickness=1,
+            highlightbackground="#aab2bd",
+        )
         self.preview.grid(row=0, column=0, sticky="nsew")
         x_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.preview.xview)
         y_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.preview.yview)
@@ -358,7 +394,14 @@ class MtfMapperGui(tk.Tk):
         self.preview.bind("<Configure>", self.on_preview_configure)
 
     def _build_settings_sidebar(self, parent: ttk.Frame) -> None:
-        props = ttk.LabelFrame(parent, text="Image")
+        setup_tabs = ttk.Notebook(parent)
+        setup_tabs.pack(fill=tk.BOTH, expand=True)
+        basic_tab = ttk.Frame(setup_tabs)
+        advanced_tab = ttk.Frame(setup_tabs)
+        setup_tabs.add(basic_tab, text="Setup")
+        setup_tabs.add(advanced_tab, text="Advanced")
+
+        props = ttk.LabelFrame(basic_tab, text="1. Image")
         props.pack(fill=tk.X, pady=(0, 8))
         self.input_label = ttk.Label(props, text="Input: none", anchor=tk.W)
         self.input_label.grid(row=0, column=0, sticky="ew", padx=8, pady=4)
@@ -366,34 +409,42 @@ class MtfMapperGui(tk.Tk):
         self.output_label.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
         props.columnconfigure(0, weight=1)
 
-        settings = ttk.LabelFrame(parent, text="Input")
+        settings = ttk.LabelFrame(basic_tab, text="2. Input interpretation")
         settings.pack(fill=tk.X, pady=(0, 8))
         ttk.Checkbutton(settings, text="Linear gamma (8 bit)", variable=self.linear).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(settings, text="Invert brightness", variable=self.invert).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(settings, text="Single edge / ROI", variable=self.single_roi).grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
         settings.columnconfigure(1, weight=1)
 
-        measurement = ttk.LabelFrame(parent, text="Measurement")
+        measurement = ttk.LabelFrame(basic_tab, text="3. Measurement")
         measurement.pack(fill=tk.X, pady=(0, 8))
-        self._labeled_entry(measurement, "Threshold", self.threshold, 0)
-        self._labeled_entry(measurement, "Pixel size (um)", self.pixelsize, 1)
-        self._labeled_entry(measurement, "MTF contrast", self.mtf, 2)
+        ttk.Label(measurement, text="Reported metric").grid(row=0, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Combobox(
+            measurement,
+            textvariable=self.mtf_metric,
+            values=("mtf_ny4", "mtf_ny2", "mtf50"),
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=1, sticky="ew", padx=8, pady=3)
+        self._labeled_entry(measurement, "Target threshold", self.threshold, 1)
+        self._labeled_entry(measurement, "Pixel size (um)", self.pixelsize, 2)
+        self._labeled_entry(measurement, "MTF contrast (%)", self.mtf, 3)
         measurement.columnconfigure(1, weight=1)
 
-        outputs = ttk.LabelFrame(parent, text="Outputs")
+        outputs = ttk.LabelFrame(basic_tab, text="4. Outputs")
         outputs.pack(fill=tk.X, pady=(0, 8))
         ttk.Checkbutton(outputs, text="Annotated image", variable=self.annotate).grid(row=0, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(outputs, text="CSV tables", variable=self.edges).grid(row=1, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(outputs, text="MTF heat map", variable=self.heatmap).grid(row=2, column=0, sticky=tk.W, padx=8, pady=3)
 
-        advanced = ttk.LabelFrame(parent, text="Advanced")
+        advanced = ttk.LabelFrame(advanced_tab, text="Detection and SFR")
         advanced.pack(fill=tk.X, pady=(0, 8))
         self._labeled_entry(advanced, "Threshold window", self.threshold_window, 0)
         ttk.Checkbutton(advanced, text="Extended SFR domain", variable=self.full_sfr).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(advanced, text="Reduced SFR smoothing", variable=self.nosmoothing).grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
         advanced.columnconfigure(1, weight=1)
 
-        raw = ttk.LabelFrame(parent, text="Raw import")
+        raw = ttk.LabelFrame(advanced_tab, text="Raw import")
         raw.pack(fill=tk.X)
         raw_enable = ttk.Checkbutton(raw, text="Read as raw pixel stream", variable=self.raw)
         raw_enable.grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
@@ -417,12 +468,23 @@ class MtfMapperGui(tk.Tk):
         parent.add(self.bottom_tabs, weight=1)
 
         results_tab = ttk.Frame(self.bottom_tabs)
+        summary = ttk.Frame(results_tab, padding=(10, 8))
+        summary.pack(fill=tk.X)
+        ttk.Label(summary, textvariable=self.summary_title, style="SummaryTitle.TLabel").pack(anchor=tk.W)
+        ttk.Label(summary, textvariable=self.summary_detail, style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 8))
+        stats = ttk.Frame(summary)
+        stats.pack(fill=tk.X)
+        self._summary_stat(stats, "Edges", self.summary_edges, 0)
+        self._summary_stat(stats, "Blocks", self.summary_blocks, 1)
+        self._summary_stat(stats, "Median MTF", self.summary_median, 2)
+        self._summary_stat(stats, "Range", self.summary_range, 3)
         self.result_tree = ttk.Treeview(results_tab, columns=("path",), show="tree", height=7)
         self.result_tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.result_tree.bind("<<TreeviewSelect>>", self.on_result_selected)
         result_buttons = ttk.Frame(results_tab)
         result_buttons.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Button(result_buttons, text="Open selected", command=self.open_selected_result).pack(side=tk.LEFT)
+        ttk.Button(result_buttons, text="Open output folder", command=self.open_output_folder).pack(side=tk.LEFT, padx=(6, 0))
         self.bottom_tabs.add(results_tab, text="Results")
 
         sfr_tab = ttk.Frame(self.bottom_tabs)
@@ -439,6 +501,13 @@ class MtfMapperGui(tk.Tk):
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.log_text.config(state=tk.DISABLED)
         self.bottom_tabs.add(log_tab, text="Log")
+
+    def _summary_stat(self, parent: ttk.Frame, label: str, variable: StringVar, column: int) -> None:
+        card = ttk.Frame(parent, padding=(10, 4))
+        card.grid(row=0, column=column, sticky="ew", padx=(0, 6))
+        ttk.Label(card, text=label, style="Muted.TLabel").pack(anchor=tk.W)
+        ttk.Label(card, textvariable=variable, style="StatValue.TLabel").pack(anchor=tk.W)
+        parent.columnconfigure(column, weight=1)
 
     def _labeled_entry(
         self,
@@ -463,6 +532,7 @@ class MtfMapperGui(tk.Tk):
         self.single_roi.set(False)
         self.input_label.config(text=f"Input: {len(self.input_files)} file(s), {self.input_files[0].name}")
         self.status.set("Image loaded; analysis will start")
+        self.show_image(self.input_files[0], [])
         if auto_run:
             self.after(50, self.run_analysis)
 
@@ -483,6 +553,7 @@ class MtfMapperGui(tk.Tk):
         self.input_label.config(text=f"Input: sample, {SAMPLE_CHART.name}")
         self.status.set("Sample loaded; analysis will start")
         self.log(f"Loaded sample chart: {SAMPLE_CHART}")
+        self.show_image(SAMPLE_CHART, [])
         self.after(50, self.run_analysis)
 
     def choose_output_dir(self) -> None:
@@ -542,7 +613,10 @@ class MtfMapperGui(tk.Tk):
             messagebox.showwarning("No outputs", "Select at least one output.")
             return
         self.run_button.config(state=tk.DISABLED)
-        self.status.set("Analyzing...")
+        self.progress.start(12)
+        self.status.set(f"Analyzing {len(self.input_files)} image(s)...")
+        self.summary_title.set("Analysis in progress")
+        self.summary_detail.set("Detecting targets and calculating edge response.")
         self.log(f"Starting analysis for {len(self.input_files)} file(s)")
         values = self.current_values()
         thread = threading.Thread(target=self._run_worker, args=(self.input_files.copy(), values), daemon=True)
@@ -573,11 +647,13 @@ class MtfMapperGui(tk.Tk):
                     self.add_result(payload)  # type: ignore[arg-type]
                 elif kind == "error":
                     self.run_button.config(state=tk.NORMAL)
+                    self.progress.stop()
                     self.status.set("Analysis failed")
                     self.log(f"Analysis failed: {payload}")
                     messagebox.showerror("Analysis failed", str(payload))
                 elif kind == "done":
                     self.run_button.config(state=tk.NORMAL)
+                    self.progress.stop()
                     self.status.set("Analysis complete")
                     self.log("Analysis complete")
         except queue.Empty:
@@ -592,6 +668,22 @@ class MtfMapperGui(tk.Tk):
             self.result_rows[item_id] = path
         self.result_tree.item(parent_id, open=True)
         self.log(f"{result.input_path.name}: measured {result.edge_count} edges")
+        summary = summarize_measurements(result.measurements)
+        metric = result.measurements[0].mtf_column if result.measurements else self.mtf_metric.get()
+        self.summary_title.set(f"{result.input_path.name} - analysis complete")
+        if result.measurements:
+            self.summary_detail.set(f"Measured {metric}. Click an annotated edge to inspect its SFR curve.")
+            self.summary_edges.set(str(summary["edges"]))
+            self.summary_blocks.set(str(summary["blocks"]))
+            self.summary_median.set(f"{summary['median']:.3f}")
+            self.summary_range.set(f"{summary['minimum']:.3f}-{summary['maximum']:.3f}")
+        else:
+            self.summary_detail.set("No valid slanted edges were detected. Check the image and detection settings.")
+            self.summary_edges.set("0")
+            self.summary_blocks.set("0")
+            self.summary_median.set("-")
+            self.summary_range.set("-")
+        self.bottom_tabs.select(0)
         annotated = result.output_dir / "annotated.png"
         if annotated.exists():
             self.show_image(annotated, result.measurements)
@@ -614,6 +706,12 @@ class MtfMapperGui(tk.Tk):
         self.selected_edge.set("No edge selected")
         self.sfr_canvas.delete("all")
         self.status.set("Results cleared")
+        self.summary_title.set("No analysis yet")
+        self.summary_detail.set("Open an image or try the sample chart to see a measurement summary.")
+        self.summary_edges.set("-")
+        self.summary_blocks.set("-")
+        self.summary_median.set("-")
+        self.summary_range.set("-")
         self.log("Results cleared")
 
     def on_result_selected(self, _event: tk.Event) -> None:
@@ -636,8 +734,12 @@ class MtfMapperGui(tk.Tk):
         if path is not None:
             open_with_system(path)
 
+    def open_output_folder(self) -> None:
+        open_with_system(self.current_output_root)
+
     def clear_preview(self, text: str) -> None:
         self.preview.delete("all")
+        self.preview_info.set("No image")
         self.preview.configure(scrollregion=(0, 0, max(self.preview.winfo_width(), 320), max(self.preview.winfo_height(), 200)))
         self.preview.create_text(
             max(self.preview.winfo_width() // 2, 160),
@@ -689,13 +791,33 @@ class MtfMapperGui(tk.Tk):
                 offset_y,
             )
             self.preview.delete("all")
+            self.preview.create_rectangle(
+                offset_x - 2,
+                offset_y - 2,
+                offset_x + display_width + 2,
+                offset_y + display_height + 2,
+                fill="#ffffff",
+                outline="#5f6875",
+                width=2,
+            )
             self.preview.create_image(offset_x, offset_y, image=image, anchor=tk.NW)
+            self.preview.create_rectangle(
+                offset_x,
+                offset_y,
+                offset_x + display_width,
+                offset_y + display_height,
+                outline="#3f4854",
+                width=1,
+            )
             self.preview.configure(scrollregion=(0, 0, scroll_width, scroll_height))
             if reset_view:
                 self.preview.xview_moveto(0.0)
                 self.preview.yview_moveto(0.0)
             hint = " - click near an edge to view SFR" if self.preview_measurements else ""
             self.status.set(f"Previewing {self.preview_path.name}{hint}")
+            self.preview_info.set(
+                f"{self.preview_path.name}  |  {image_width} x {image_height} px  |  {self.preview_zoom * 100:.0f}%"
+            )
         except (tk.TclError, ValueError) as exc:
             self.clear_preview(f"Cannot preview {self.preview_path.name}")
             self.log(str(exc))
