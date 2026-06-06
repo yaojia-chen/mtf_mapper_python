@@ -43,11 +43,11 @@ workspace:
 - top toolbar for opening files, loading the sample chart, choosing output, and running analysis
 - left sidebar for input, measurement, output, advanced, and raw import settings
 - central annotated image preview
-- lower tabs for results, SFR curve, CSV preview, and log output
+- lower tabs for results, curve inspection, and log output
 
 When an annotated image is shown, click near an annotated edge/ROI to update
-the docked SFR curve tab. Hover over the SFR curve to show a dashed vertical
-readout line with the corresponding frequency and SFR value.
+the docked curve inspector. Switch between SFR, ESF, and LSF, then hover over
+the curve to show a dashed vertical readout line with the corresponding values.
 
 ## Sample Image
 

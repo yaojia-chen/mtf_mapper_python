@@ -26,6 +26,9 @@ edges or exported files when more detail is needed.
 5. `04-magenta-annotations.png` - Refined annotation treatment. Healthy: vivid
    magenta labels remain distinct from both the black targets and white chart
    at fit-to-window scale.
+6. `05-esf-curve-inspector.png` - Expanded edge inspection. Healthy: users can
+   switch between SFR, ESF, and LSF while preserving edge context and hover
+   readouts.
 
 ## Strengths
 

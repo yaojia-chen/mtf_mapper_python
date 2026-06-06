@@ -54,14 +54,17 @@ class PreviewState:
 
 
 @dataclass
-class SfrPlotState:
-    measurement: mtf_mapper_py.EdgeMeasurement
+class CurvePlotState:
+    values: np.ndarray
     x0: float
     y0: float
     x1: float
     y1: float
+    y_min: float
     y_max: float
-    max_frequency: float
+    x_min: float
+    x_max: float
+    x_unit: str
 
 
 def summarize_measurements(measurements: list[mtf_mapper_py.EdgeMeasurement]) -> dict[str, float | int]:
@@ -201,43 +204,69 @@ def photo_image_from_cv(path: Path, display_scale: float) -> tuple[tk.PhotoImage
     return tk.PhotoImage(data=data.tobytes(), format="PPM"), width, height, display_width, display_height
 
 
-def draw_sfr_curve(canvas: tk.Canvas, measurement: mtf_mapper_py.EdgeMeasurement) -> SfrPlotState | None:
+def curve_data(
+    measurement: mtf_mapper_py.EdgeMeasurement,
+    curve_type: str,
+) -> tuple[np.ndarray, float, float, str, str, str]:
+    if curve_type == "ESF":
+        values = measurement.esf
+        half_span = max((len(values) - 1) * measurement.sample_spacing / 2.0, 0.0)
+        return values, -half_span, half_span, "Distance across edge (pixels)", "ESF", "px"
+    if curve_type == "LSF":
+        values = measurement.lsf
+        half_span = max((len(values) - 1) * measurement.sample_spacing / 2.0, 0.0)
+        return values, -half_span, half_span, "Distance across edge (pixels)", "LSF", "px"
+    values = measurement.sfr
+    return values, 0.0, (len(values) - 1) / 64.0, "Frequency (cycles/pixel)", "SFR", "c/p"
+
+
+def draw_curve(canvas: tk.Canvas, measurement: mtf_mapper_py.EdgeMeasurement, curve_type: str) -> CurvePlotState | None:
     canvas.delete("all")
     width = max(canvas.winfo_width(), 320)
     height = max(canvas.winfo_height(), 220)
-    left, right, top, bottom = 58, 20, 20, 46
+    left, right, top, bottom = 68, 20, 20, 70
     plot_w = max(width - left - right, 1)
     plot_h = max(height - top - bottom, 1)
     x0, y0 = left, height - bottom
     x1, y1 = width - right, top
+
+    values, x_min, x_max, x_label, y_label, x_unit = curve_data(measurement, curve_type)
+    if len(values) < 2:
+        return None
+    finite_values = values[np.isfinite(values)]
+    if not finite_values.size:
+        return None
+    y_min = float(np.min(finite_values))
+    y_max = float(np.max(finite_values))
+    if curve_type in ("SFR", "ESF"):
+        y_min = min(y_min, 0.0)
+        y_max = max(y_max, 1.0)
+    if y_max - y_min < 1e-12:
+        y_max = y_min + 1.0
 
     canvas.create_rectangle(x0, y1, x1, y0, outline="#a0a0a0")
     for tick in range(5):
         frac = tick / 4
         y = y0 - frac * plot_h
         canvas.create_line(x0, y, x1, y, fill="#ececec")
-        canvas.create_text(x0 - 8, y, text=f"{frac:.2f}", anchor=tk.E, fill="#555555", font=("TkDefaultFont", 9))
+        value = y_min + frac * (y_max - y_min)
+        canvas.create_text(x0 - 8, y, text=f"{value:.2f}", anchor=tk.E, fill="#555555", font=("TkDefaultFont", 9))
     for tick in range(5):
         frac = tick / 4
         x = x0 + frac * plot_w
-        freq = frac if len(measurement.sfr) <= 64 else frac * 2.0
+        value = x_min + frac * (x_max - x_min)
         canvas.create_line(x, y0, x, y0 + 4, fill="#666666")
-        canvas.create_text(x, y0 + 18, text=f"{freq:.2f}", anchor=tk.N, fill="#555555", font=("TkDefaultFont", 9))
+        canvas.create_text(x, y0 + 18, text=f"{value:.2f}", anchor=tk.N, fill="#555555", font=("TkDefaultFont", 9))
 
-    sfr = measurement.sfr
-    if len(sfr) < 2:
-        return None
-    sfr_max = max(float(v) for v in sfr)
-    y_max = max(sfr_max, 1.0) if sfr_max > 0 else 1.0
     points: list[float] = []
-    for idx, value in enumerate(sfr):
-        x = x0 + (idx / (len(sfr) - 1)) * plot_w
-        y = y0 - min(max(float(value), 0.0), y_max) / y_max * plot_h
+    for idx, value in enumerate(values):
+        x = x0 + (idx / (len(values) - 1)) * plot_w
+        y = y0 - (float(value) - y_min) / (y_max - y_min) * plot_h
         points.extend([x, y])
     canvas.create_line(*points, fill="#0b63ce", width=2, smooth=True)
-    canvas.create_text(width // 2, height - 8, text="Frequency (cycles/pixel)", anchor=tk.S, fill="#333333")
-    canvas.create_text(12, top, text="SFR", anchor=tk.NW, fill="#333333")
-    return SfrPlotState(measurement, x0, y0, x1, y1, y_max, (len(sfr) - 1) / 64.0)
+    canvas.create_text(width // 2, height - 8, text=x_label, anchor=tk.S, fill="#333333")
+    canvas.create_text(14, (y0 + y1) / 2, text=y_label, angle=90, fill="#333333")
+    return CurvePlotState(values, x0, y0, x1, y1, y_min, y_max, x_min, x_max, x_unit)
 
 
 class MtfMapperGui(tk.Tk):
@@ -259,7 +288,7 @@ class MtfMapperGui(tk.Tk):
         self.preview_fit_scale = 1.0
         self.preview_drag_start: tuple[int, int] | None = None
         self.selected_measurement: mtf_mapper_py.EdgeMeasurement | None = None
-        self.sfr_plot_state: SfrPlotState | None = None
+        self.curve_plot_state: CurvePlotState | None = None
         self.raw_widgets: list[tk.Widget] = []
         self.current_output_root = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui"
 
@@ -299,8 +328,10 @@ class MtfMapperGui(tk.Tk):
         self.summary_median = StringVar(value="-")
         self.summary_range = StringVar(value="-")
         self.preview_info = StringVar(value="No image")
+        self.curve_type = StringVar(value="SFR")
         self.selected_edge = StringVar(value="No edge selected")
         self.raw.trace_add("write", lambda *_args: self._update_raw_controls())
+        self.curve_type.trace_add("write", lambda *_args: self.redraw_selected_curve())
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -488,13 +519,23 @@ class MtfMapperGui(tk.Tk):
         self.bottom_tabs.add(results_tab, text="Results")
 
         sfr_tab = ttk.Frame(self.bottom_tabs)
-        ttk.Label(sfr_tab, textvariable=self.selected_edge, anchor=tk.W).pack(fill=tk.X, padx=8, pady=(8, 0))
+        curve_header = ttk.Frame(sfr_tab)
+        curve_header.pack(fill=tk.X, padx=8, pady=(8, 0))
+        ttk.Label(curve_header, textvariable=self.selected_edge, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(curve_header, text="Curve").pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Combobox(
+            curve_header,
+            textvariable=self.curve_type,
+            values=("SFR", "ESF", "LSF"),
+            state="readonly",
+            width=6,
+        ).pack(side=tk.LEFT)
         self.sfr_canvas = tk.Canvas(sfr_tab, background="white", highlightthickness=1, highlightbackground="#c8c8c8")
         self.sfr_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self.sfr_canvas.bind("<Configure>", lambda _event: self.redraw_selected_sfr())
+        self.sfr_canvas.bind("<Configure>", lambda _event: self.redraw_selected_curve())
         self.sfr_canvas.bind("<Motion>", self.on_sfr_hover)
         self.sfr_canvas.bind("<Leave>", self.on_sfr_leave)
-        self.bottom_tabs.add(sfr_tab, text="SFR Curve")
+        self.bottom_tabs.add(sfr_tab, text="Curve Inspector")
 
         log_tab = ttk.Frame(self.bottom_tabs)
         self.log_text = ScrolledText(log_tab, height=8, wrap=tk.WORD)
@@ -672,7 +713,7 @@ class MtfMapperGui(tk.Tk):
         metric = result.measurements[0].mtf_column if result.measurements else self.mtf_metric.get()
         self.summary_title.set(f"{result.input_path.name} - analysis complete")
         if result.measurements:
-            self.summary_detail.set(f"Measured {metric}. Click an annotated edge to inspect its SFR curve.")
+            self.summary_detail.set(f"Measured {metric}. Click an annotated edge to inspect its SFR, ESF, and LSF curves.")
             self.summary_edges.set(str(summary["edges"]))
             self.summary_blocks.set(str(summary["blocks"]))
             self.summary_median.set(f"{summary['median']:.3f}")
@@ -702,7 +743,7 @@ class MtfMapperGui(tk.Tk):
         self.preview_path = None
         self.preview_measurements = []
         self.selected_measurement = None
-        self.sfr_plot_state = None
+        self.curve_plot_state = None
         self.selected_edge.set("No edge selected")
         self.sfr_canvas.delete("all")
         self.status.set("Results cleared")
@@ -884,52 +925,52 @@ class MtfMapperGui(tk.Tk):
             return
         distance = distance_to_measurement(measurement, image_x, image_y)
         if distance > 72.0:
-            self.status.set("Click closer to an annotated edge to view its SFR curve")
+            self.status.set("Click closer to an annotated edge to inspect its curves")
             return
-        self.show_sfr_curve(measurement)
+        self.show_edge_curves(measurement)
 
-    def show_sfr_curve(self, measurement: mtf_mapper_py.EdgeMeasurement) -> None:
+    def show_edge_curves(self, measurement: mtf_mapper_py.EdgeMeasurement) -> None:
         self.selected_measurement = measurement
         self.selected_edge.set(
             f"Block {measurement.block_id}  Edge ({measurement.edge_x:.1f}, {measurement.edge_y:.1f})  "
             f"{measurement.mtf_column}={measurement.mtf_value:.4g}"
         )
-        self.redraw_selected_sfr()
+        self.redraw_selected_curve()
         self.bottom_tabs.select(self.sfr_canvas.master)
-        self.status.set("Showing SFR curve for selected edge")
+        self.status.set(f"Showing {self.curve_type.get()} curve for selected edge")
 
-    def redraw_selected_sfr(self) -> None:
+    def redraw_selected_curve(self) -> None:
         self.sfr_canvas.delete("all")
         if self.selected_measurement is None:
-            self.sfr_plot_state = None
+            self.curve_plot_state = None
             self.sfr_canvas.create_text(
                 max(self.sfr_canvas.winfo_width() // 2, 160),
                 max(self.sfr_canvas.winfo_height() // 2, 100),
-                text="Click an annotated edge to view its SFR curve",
+                text="Click an annotated edge to inspect its SFR, ESF, and LSF curves",
                 fill="#555555",
             )
             return
-        self.sfr_plot_state = draw_sfr_curve(self.sfr_canvas, self.selected_measurement)
+        self.curve_plot_state = draw_curve(self.sfr_canvas, self.selected_measurement, self.curve_type.get())
+        self.status.set(f"Showing {self.curve_type.get()} curve for selected edge")
 
     def on_sfr_hover(self, event: tk.Event) -> None:
-        state = self.sfr_plot_state
+        state = self.curve_plot_state
         if state is None:
             return
         self.sfr_canvas.delete("hover")
         if event.x < state.x0 or event.x > state.x1 or event.y < state.y1 or event.y > state.y0:
             return
         frac = (event.x - state.x0) / max(state.x1 - state.x0, 1.0)
-        frequency = frac * state.max_frequency
-        sample_index = min(max(frequency * 64.0, 0.0), len(state.measurement.sfr) - 1)
-        indices = list(range(len(state.measurement.sfr)))
-        value = float(np.interp(sample_index, indices, state.measurement.sfr))
-        y = state.y0 - min(max(value, 0.0), state.y_max) / state.y_max * (state.y0 - state.y1)
+        x_value = state.x_min + frac * (state.x_max - state.x_min)
+        sample_index = frac * (len(state.values) - 1)
+        value = float(np.interp(sample_index, np.arange(len(state.values)), state.values))
+        y = state.y0 - (value - state.y_min) / (state.y_max - state.y_min) * (state.y0 - state.y1)
         self.sfr_canvas.create_line(event.x, state.y1, event.x, state.y0, fill="#d12b2b", dash=(5, 4), tags="hover")
         self.sfr_canvas.create_oval(event.x - 3, y - 3, event.x + 3, y + 3, fill="#d12b2b", outline="", tags="hover")
-        label = f"x={frequency:.4f} c/p, y={value:.4f}"
-        label_x = min(max(event.x + 10, state.x0 + 4), state.x1 - 135)
+        label = f"x={x_value:.4f} {state.x_unit}, y={value:.4f}"
+        label_x = min(max(event.x + 10, state.x0 + 4), state.x1 - 225)
         label_y = state.y1 + 10
-        self.sfr_canvas.create_rectangle(label_x - 4, label_y - 4, label_x + 132, label_y + 18, fill="white", outline="#b0b0b0", tags="hover")
+        self.sfr_canvas.create_rectangle(label_x - 4, label_y - 4, label_x + 222, label_y + 18, fill="white", outline="#b0b0b0", tags="hover")
         self.sfr_canvas.create_text(label_x, label_y, text=label, anchor=tk.NW, fill="#333333", tags="hover")
 
     def on_sfr_leave(self, _event: tk.Event) -> None:

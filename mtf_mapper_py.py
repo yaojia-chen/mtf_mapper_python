@@ -13,7 +13,7 @@ import csv
 import logging
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -57,6 +57,9 @@ class EdgeMeasurement:
     edge_start_y: float = 0.0
     edge_end_x: float = 0.0
     edge_end_y: float = 0.0
+    esf: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
+    lsf: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
+    sample_spacing: float = 1.0
 
 
 @dataclass
@@ -330,6 +333,11 @@ def sfr_from_esf(esf: np.ndarray, sample_spacing: float, smooth: bool, full_sfr:
     return freqs[keep], sfr[keep]
 
 
+def edge_profiles_from_esf(esf: np.ndarray, sample_spacing: float, smooth: bool) -> tuple[np.ndarray, np.ndarray]:
+    smoothed_esf = smooth_esf(esf.astype(np.float64), smooth)
+    return smoothed_esf, np.gradient(smoothed_esf, sample_spacing)
+
+
 def interpolate_mtf(freqs: np.ndarray, sfr: np.ndarray, contrast: float) -> float:
     if not 0 < contrast < 1:
         raise ValueError("MTF contrast must be between 1 and 99")
@@ -402,6 +410,7 @@ def measure_edge(
 ) -> EdgeMeasurement:
     esf, spacing, edge_contrast = esf_from_edge(lum, p0, p1)
     freqs, sfr = sfr_from_esf(esf, spacing, smooth=smooth, full_sfr=full_sfr)
+    display_esf, display_lsf = edge_profiles_from_esf(esf, spacing, smooth=smooth)
     mtf_value = reported_mtf_value(freqs, sfr, mtf_metric, mtf_contrast, pixel_size)
     center = (p0 + p1) * 0.5
     return EdgeMeasurement(
@@ -421,6 +430,9 @@ def measure_edge(
         edge_start_y=float(p0[1]),
         edge_end_x=float(p1[0]),
         edge_end_y=float(p1[1]),
+        esf=display_esf,
+        lsf=display_lsf,
+        sample_spacing=spacing,
     )
 
 

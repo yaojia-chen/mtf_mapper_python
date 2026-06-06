@@ -135,6 +135,36 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertTrue(math.isfinite(mtf50))
         self.assertGreater(mtf50, 0.0)
 
+    def test_edge_profiles_and_gui_curve_data(self):
+        x = np.linspace(-8.0, 8.0, 129)
+        source_esf = 0.5 + 0.5 * np.tanh(x)
+        esf, lsf = mtf_mapper_py.edge_profiles_from_esf(source_esf, sample_spacing=0.125, smooth=False)
+        measurement = mtf_mapper_py.EdgeMeasurement(
+            1,
+            10.0,
+            10.0,
+            0.5,
+            "mtf_ny4",
+            "mtf_ny4",
+            0.0,
+            0.0,
+            4.0,
+            0.0,
+            np.array([1.0, 0.5]),
+            0.8,
+            esf=esf,
+            lsf=lsf,
+            sample_spacing=0.125,
+        )
+        values, x_min, x_max, x_label, y_label, unit = mtf_mapper_gui.curve_data(measurement, "LSF")
+        self.assertEqual(len(values), len(source_esf))
+        self.assertLess(x_min, 0.0)
+        self.assertGreater(x_max, 0.0)
+        self.assertEqual(x_label, "Distance across edge (pixels)")
+        self.assertEqual(y_label, "LSF")
+        self.assertEqual(unit, "px")
+        self.assertGreater(float(np.max(lsf)), 0.0)
+
     def test_reported_fixed_frequency_mtf(self):
         freqs = np.array([0.0, 0.125, 0.25, 0.5])
         sfr = np.array([1.0, 0.8, 0.6, 0.2])
