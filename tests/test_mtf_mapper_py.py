@@ -28,6 +28,7 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertEqual(args.mtf_metric, "mtf_ny4")
         self.assertEqual(args.threshold_mode, "hybrid")
         self.assertEqual(args.roi_radius, 12.0)
+        self.assertEqual(args.esf_method, "pixel-binned")
         self.assertFalse(args.auto_tune)
 
     def test_raw_requires_dimensions(self):
@@ -43,6 +44,7 @@ class MtfMapperPyTests(unittest.TestCase):
                 "threshold_mode": "adaptive",
                 "threshold_window": 0.25,
                 "roi_radius": 18.0,
+                "esf_method": "Auto fallback",
                 "linear": True,
                 "invert": True,
                 "single_roi": True,
@@ -74,6 +76,7 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertTrue(args.heatmap)
         self.assertEqual(args.threshold_mode, "adaptive")
         self.assertEqual(args.roi_radius, 18.0)
+        self.assertEqual(args.esf_method, "auto")
         self.assertEqual(
             mtf_mapper_gui.normalize_threshold_mode("Hybrid (adaptive + global)"),
             "hybrid",
@@ -103,6 +106,15 @@ class MtfMapperPyTests(unittest.TestCase):
             offset_y=10,
         )
         self.assertEqual(mtf_mapper_gui.preview_to_image_coords(15, 20, state), (20, 20))
+
+    def test_gui_trackpad_zoom_factors_are_smooth_and_bounded(self):
+        self.assertAlmostEqual(mtf_mapper_gui.wheel_zoom_factor(120), 1.15)
+        self.assertAlmostEqual(mtf_mapper_gui.wheel_zoom_factor(-120), 1 / 1.15)
+        self.assertGreater(mtf_mapper_gui.wheel_zoom_factor(1), 1.0)
+        self.assertLess(mtf_mapper_gui.wheel_zoom_factor(1), 1.1)
+        self.assertGreater(mtf_mapper_gui.magnify_zoom_factor(0.1), 1.0)
+        self.assertLess(mtf_mapper_gui.magnify_zoom_factor(-0.1), 1.0)
+        self.assertLessEqual(mtf_mapper_gui.magnify_zoom_factor(10.0), math.exp(0.7))
 
     def test_gui_measurement_summary(self):
         measurements = [
@@ -199,6 +211,49 @@ class MtfMapperPyTests(unittest.TestCase):
         large_esf, _, _ = mtf_mapper_py.esf_from_edge(lum, p0, p1, radius=18.0)
         self.assertEqual(spacing, 0.125)
         self.assertGreater(len(large_esf), len(small_esf))
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_pixel_binned_esf_uses_original_pixels_and_reports_occupancy(self):
+        lum = np.zeros((100, 120), dtype=np.float64)
+        yy, xx = np.indices(lum.shape)
+        lum[xx > 50.0 + 0.15 * yy] = 1.0
+        p0 = np.array([53.0, 20.0])
+        p1 = np.array([62.0, 80.0])
+        result = mtf_mapper_py.pixel_binned_esf_from_edge(lum, p0, p1, oversampling=8, radius=10.0)
+        self.assertEqual(result.method, "pixel-binned")
+        self.assertEqual(result.sample_spacing, 0.125)
+        self.assertGreater(result.bin_occupancy, 0.75)
+        self.assertGreater(result.contrast, 0.8)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_auto_esf_falls_back_for_axis_aligned_edge(self):
+        lum = np.zeros((80, 100), dtype=np.float64)
+        lum[:, 50:] = 1.0
+        p0 = np.array([50.0, 10.0])
+        p1 = np.array([50.0, 70.0])
+        result = mtf_mapper_py.create_esf_from_edge(lum, p0, p1, method="auto")
+        self.assertEqual(result.method, "interpolated")
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_measure_edge_reports_sparse_pixel_bins(self):
+        lum = np.zeros((80, 100), dtype=np.float64)
+        lum[:, 50:] = 1.0
+        measurement = mtf_mapper_py.measure_edge(
+            lum,
+            1,
+            np.array([50.0, 10.0]),
+            np.array([50.0, 70.0]),
+            np.array([50.0, 10.0]),
+            50.0,
+            "mtf_ny4",
+            False,
+            True,
+            None,
+            esf_method="pixel-binned",
+        )
+        self.assertEqual(measurement.esf_method, "pixel-binned")
+        self.assertLess(measurement.bin_occupancy, 0.5)
+        self.assertTrue(any("sparse pixel bins" in note for note in measurement.quality_notes))
 
     @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
     def test_detection_report_and_auto_tune(self):

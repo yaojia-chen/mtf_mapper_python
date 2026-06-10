@@ -64,6 +64,17 @@ class EdgeMeasurement:
     quality_score: float = 0.0
     quality_label: str = "Unknown"
     quality_notes: tuple[str, ...] = ()
+    esf_method: str = "pixel-binned"
+    bin_occupancy: float = 1.0
+
+
+@dataclass
+class EsfResult:
+    values: np.ndarray
+    sample_spacing: float
+    contrast: float
+    method: str
+    bin_occupancy: float = 1.0
 
 
 @dataclass
@@ -349,13 +360,21 @@ def sample_bilinear(lum: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray
     ).astype(np.float64)
 
 
-def esf_from_edge(
+def orient_esf(esf: np.ndarray, oversampling: int) -> tuple[np.ndarray, float]:
+    low_mean = float(np.mean(esf[:oversampling * 4]))
+    high_mean = float(np.mean(esf[-oversampling * 4:]))
+    if low_mean > high_mean:
+        esf = esf[::-1]
+    return esf, abs(high_mean - low_mean)
+
+
+def interpolated_esf_from_edge(
     lum: np.ndarray,
     p0: np.ndarray,
     p1: np.ndarray,
     oversampling: int = 8,
     radius: float = 12.0,
-) -> tuple[np.ndarray, float, float]:
+) -> EsfResult:
     tangent = p1 - p0
     length = float(np.linalg.norm(tangent))
     if length < 8:
@@ -382,12 +401,90 @@ def esf_from_edge(
         raise ValueError("not enough valid ESF samples")
     esf = np.interp(np.arange(esf.size), np.flatnonzero(valid), esf[valid])
 
-    low_mean = float(np.mean(esf[:oversampling * 4]))
-    high_mean = float(np.mean(esf[-oversampling * 4:]))
-    if low_mean > high_mean:
-        esf = esf[::-1]
-    contrast = abs(high_mean - low_mean)
-    return esf, 1.0 / oversampling, contrast
+    esf, contrast = orient_esf(esf, oversampling)
+    return EsfResult(esf, 1.0 / oversampling, contrast, "interpolated", 1.0)
+
+
+def pixel_binned_esf_from_edge(
+    lum: np.ndarray,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    oversampling: int = 8,
+    radius: float = 12.0,
+) -> EsfResult:
+    tangent = p1 - p0
+    length = float(np.linalg.norm(tangent))
+    if length < 8:
+        raise ValueError("edge is too short")
+    tangent /= length
+    normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+    center = (p0 + p1) * 0.5
+
+    margin = radius + 2.0
+    min_x = max(0, int(math.floor(min(p0[0], p1[0]) - margin)))
+    max_x = min(lum.shape[1] - 1, int(math.ceil(max(p0[0], p1[0]) + margin)))
+    min_y = max(0, int(math.floor(min(p0[1], p1[1]) - margin)))
+    max_y = min(lum.shape[0] - 1, int(math.ceil(max(p0[1], p1[1]) + margin)))
+    grid_x, grid_y = np.meshgrid(
+        np.arange(min_x, max_x + 1, dtype=np.float64),
+        np.arange(min_y, max_y + 1, dtype=np.float64),
+    )
+    delta_x = grid_x - center[0]
+    delta_y = grid_y - center[1]
+    along = delta_x * tangent[0] + delta_y * tangent[1]
+    across = delta_x * normal[0] + delta_y * normal[1]
+    selected = (np.abs(along) <= 0.45 * length) & (across >= -radius) & (across <= radius)
+    if int(np.count_nonzero(selected)) < oversampling * 8:
+        raise ValueError("not enough source pixels for pixel-binned ESF")
+
+    spacing = 1.0 / oversampling
+    bin_count = int(round(2.0 * radius * oversampling)) + 1
+    bin_indices = np.floor((across[selected] + radius) / spacing).astype(np.int64)
+    bin_indices = np.clip(bin_indices, 0, bin_count - 1)
+    sums = np.bincount(bin_indices, weights=lum[min_y : max_y + 1, min_x : max_x + 1][selected], minlength=bin_count)
+    counts = np.bincount(bin_indices, minlength=bin_count)
+    valid = counts > 0
+    occupancy = float(np.mean(valid))
+    if int(np.count_nonzero(valid)) < 8:
+        raise ValueError("pixel-binned ESF has too few populated bins")
+    esf = np.empty(bin_count, dtype=np.float64)
+    esf[valid] = sums[valid] / counts[valid]
+    esf[~valid] = np.interp(np.flatnonzero(~valid), np.flatnonzero(valid), esf[valid])
+    esf, contrast = orient_esf(esf, oversampling)
+    return EsfResult(esf, spacing, contrast, "pixel-binned", occupancy)
+
+
+def create_esf_from_edge(
+    lum: np.ndarray,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    oversampling: int = 8,
+    radius: float = 12.0,
+    method: str = "pixel-binned",
+) -> EsfResult:
+    if method == "interpolated":
+        return interpolated_esf_from_edge(lum, p0, p1, oversampling, radius)
+    if method == "auto":
+        try:
+            result = pixel_binned_esf_from_edge(lum, p0, p1, oversampling, radius)
+            if result.bin_occupancy >= 0.5 and folded_edge_angle(p0, p1) >= 1.0:
+                return result
+        except ValueError:
+            pass
+        return interpolated_esf_from_edge(lum, p0, p1, oversampling, radius)
+    return pixel_binned_esf_from_edge(lum, p0, p1, oversampling, radius)
+
+
+def esf_from_edge(
+    lum: np.ndarray,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    oversampling: int = 8,
+    radius: float = 12.0,
+    method: str = "pixel-binned",
+) -> tuple[np.ndarray, float, float]:
+    result = create_esf_from_edge(lum, p0, p1, oversampling, radius, method)
+    return result.values, result.sample_spacing, result.contrast
 
 
 def sfr_from_esf(esf: np.ndarray, sample_spacing: float, smooth: bool, full_sfr: bool) -> tuple[np.ndarray, np.ndarray]:
@@ -481,8 +578,12 @@ def measure_edge(
     smooth: bool,
     pixel_size: float | None,
     roi_radius: float = 12.0,
+    esf_method: str = "pixel-binned",
 ) -> EdgeMeasurement:
-    esf, spacing, edge_contrast = esf_from_edge(lum, p0, p1, radius=roi_radius)
+    esf_result = create_esf_from_edge(lum, p0, p1, radius=roi_radius, method=esf_method)
+    esf = esf_result.values
+    spacing = esf_result.sample_spacing
+    edge_contrast = esf_result.contrast
     freqs, sfr = sfr_from_esf(esf, spacing, smooth=smooth, full_sfr=full_sfr)
     display_esf, display_lsf = edge_profiles_from_esf(esf, spacing, smooth=smooth)
     mtf_value = reported_mtf_value(freqs, sfr, mtf_metric, mtf_contrast, pixel_size)
@@ -493,11 +594,17 @@ def measure_edge(
         notes.append("low contrast")
     if angle < 1.0:
         notes.append("edge angle is nearly axis-aligned")
+    if esf_result.method == "pixel-binned" and esf_result.bin_occupancy < 0.5:
+        notes.append(f"sparse pixel bins ({esf_result.bin_occupancy:.0%} occupied)")
+    if esf_result.method == "interpolated" and esf_method == "auto":
+        notes.append("pixel binning unsuitable; used interpolated fallback")
     if not math.isfinite(mtf_value):
         notes.append("reported MTF could not be resolved")
     quality_score = float(np.clip(edge_contrast / 0.35, 0.0, 1.0))
     if angle < 1.0:
         quality_score *= 0.65
+    if esf_result.method == "pixel-binned" and esf_result.bin_occupancy < 0.5:
+        quality_score *= max(0.4, esf_result.bin_occupancy / 0.5)
     if not math.isfinite(mtf_value):
         quality_score *= 0.4
     quality_label = "Good" if quality_score >= 0.7 else "Review" if quality_score >= 0.4 else "Poor"
@@ -524,6 +631,8 @@ def measure_edge(
         quality_score=quality_score,
         quality_label=quality_label,
         quality_notes=tuple(notes),
+        esf_method=esf_result.method,
+        bin_occupancy=esf_result.bin_occupancy,
     )
 
 
@@ -598,6 +707,7 @@ def analyze_image(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, lis
                     smooth=not args.nosmoothing,
                     pixel_size=args.pixelsize,
                     roi_radius=args.roi_radius,
+                    esf_method=args.esf_method,
                 )
             except ValueError as exc:
                 LOGGER.warning("skipping edge in block %d: %s", block_id, exc)
@@ -730,6 +840,8 @@ def write_diagnostics(output_dir: Path, report: DetectionReport, measurements: S
                 "score": m.quality_score,
                 "label": m.quality_label,
                 "notes": list(m.quality_notes),
+                "esf_method": m.esf_method,
+                "bin_occupancy": m.bin_occupancy,
             }
             for m in measurements
         ],
@@ -848,6 +960,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--threshold-window", type=float, default=1.0 / 3.0, help="adaptive threshold window fraction")
     parser.add_argument("--roi-radius", type=float, default=12.0, help="edge sampling radius in pixels")
+    parser.add_argument(
+        "--esf-method",
+        default="pixel-binned",
+        choices=["pixel-binned", "interpolated", "auto"],
+        help="ESF construction: original-pixel binning, interpolated profiles, or automatic fallback",
+    )
     parser.add_argument("--auto-tune", action="store_true", help="search threshold modes and values for the strongest detection")
     parser.add_argument("-l", "--linear", action="store_true", help="treat 8-bit input as linear")
     parser.add_argument("--invert", action="store_true", help="invert brightness before processing")

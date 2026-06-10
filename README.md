@@ -36,6 +36,11 @@ and global thresholding. Use `--threshold-mode adaptive` for uneven illumination
 or mid-gray targets, or `--threshold-mode global` for a fixed cutoff only.
 Use `--roi-radius` to control the cross-edge sampling radius used for ESF, LSF,
 and SFR calculations.
+ESF construction defaults to `--esf-method pixel-binned`, which projects
+original source-pixel values into 1/8-pixel distance bins. Use
+`--esf-method interpolated` for the previous bilinearly sampled profile method,
+or `--esf-method auto` to fall back to interpolated profiles when edge angle or
+bin occupancy is unsuitable.
 Add `--auto-tune` to search the available threshold modes, thresholds, and
 adaptive-window sizes automatically. Every command-line run also writes
 `analysis_diagnostics.json` with detection counts, suggestions, and per-edge
@@ -52,23 +57,29 @@ workspace:
 
 - top toolbar for opening files, loading the sample chart, choosing output, and running analysis
 - full-width image preview as the primary workspace
-- collapsible right dock for setup, advanced settings, results, curve inspection, logs, and diagnostics
+- collapsible right dock for setup, advanced settings, results, logs, and diagnostics
 
 Use **Settings** to open the Setup dock and **Hide dock** to give the image
 nearly the full window. The divider can also be dragged to choose the preferred
 preview-to-dock balance. This side-by-side layout preserves vertical space for
 the common square and 4:3 source-image formats on wide monitors.
+The preview supports smooth mouse-wheel and trackpad zoom, including macOS
+pinch gestures when exposed by the installed Tk version. Zoom stays anchored
+under the pointer.
 
 Use the preview's View selector to switch between the original and annotated
 image after analysis. The original image remains available when analysis fails.
 The Measurement section exposes the edge ROI radius, while Advanced offers
 Hybrid, Adaptive only, and Global only target-detection modes.
+Advanced also selects Pixel binning, Automatic fallback, or Interpolated
+profiles for ESF construction. Diagnostics report the method used and flag
+sparse pixel bins or nearly axis-aligned edges.
 
-When an annotated image is shown, click near an annotated edge/ROI to update
-the docked curve inspector. Switch between SFR, ESF, and LSF, then hover over
-the curve to show a dashed vertical readout line with the corresponding values.
-The selected edge is highlighted on the image and its quality score is shown in
-the inspector.
+When an annotated image is shown, click near an annotated edge/ROI to open the
+resizable Edge Inspector window. Switch between SFR, ESF, and LSF, then hover
+over the curve to show a dashed vertical readout line with the corresponding
+values. Clicking another edge updates the same inspector window. The selected
+edge remains highlighted in the main preview.
 
 Use **Preview detection** before analysis to inspect the detected targets.
 Click a target to include or exclude it, or Shift-drag on the image to add a

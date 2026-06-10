@@ -38,6 +38,11 @@ THRESHOLD_MODE_VALUES = {
     "Adaptive only": "adaptive",
     "Global only": "global",
 }
+ESF_METHOD_VALUES = {
+    "Pixel binning": "pixel-binned",
+    "Auto fallback": "auto",
+    "Interpolated profiles": "interpolated",
+}
 PROJECT_DIR = Path(__file__).resolve().parent
 SAMPLE_CHART = PROJECT_DIR / "samples" / "mtf_test_chart.png"
 
@@ -117,6 +122,11 @@ def normalize_threshold_mode(value: object) -> str:
     return THRESHOLD_MODE_VALUES.get(text, text)
 
 
+def normalize_esf_method(value: object) -> str:
+    text = str(value)
+    return ESF_METHOD_VALUES.get(text, text)
+
+
 def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[str, object]) -> argparse.Namespace:
     raw_enabled = bool(values.get("raw", False))
     args = argparse.Namespace(
@@ -126,6 +136,7 @@ def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[s
         threshold_mode=normalize_threshold_mode(values.get("threshold_mode", "hybrid")),
         threshold_window=float(values.get("threshold_window", 1.0 / 3.0)),
         roi_radius=float(values.get("roi_radius", 12.0)),
+        esf_method=normalize_esf_method(values.get("esf_method", "pixel-binned")),
         linear=bool(values.get("linear", False)),
         invert=bool(values.get("invert", False)),
         single_roi=bool(values.get("single_roi", False)),
@@ -203,6 +214,16 @@ def distance_to_measurement(measurement: mtf_mapper_py.EdgeMeasurement, image_x:
 
 def preview_to_image_coords(event_x: int, event_y: int, state: PreviewState) -> tuple[float, float]:
     return (event_x - state.offset_x) / state.display_scale, (event_y - state.offset_y) / state.display_scale
+
+
+def wheel_zoom_factor(delta: float) -> float:
+    if abs(delta) >= 120:
+        return 1.15 ** (delta / 120.0)
+    return math.exp(max(-4.0, min(4.0, delta)) * 0.04)
+
+
+def magnify_zoom_factor(delta: float) -> float:
+    return math.exp(max(-0.7, min(0.7, delta)))
 
 
 def short_path(path: Path, max_chars: int = 32) -> str:
@@ -366,6 +387,8 @@ class MtfMapperGui(tk.Tk):
         self.preview_drag_start: tuple[int, int] | None = None
         self.selected_measurement: mtf_mapper_py.EdgeMeasurement | None = None
         self.curve_plot_state: CurvePlotState | None = None
+        self.edge_inspector: tk.Toplevel | None = None
+        self.sfr_canvas: tk.Canvas | None = None
         self.raw_widgets: list[tk.Widget] = []
         self.current_output_root = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui"
         self.dock_collapsed = False
@@ -382,6 +405,7 @@ class MtfMapperGui(tk.Tk):
         self.threshold_mode = StringVar(value="Hybrid (adaptive + global)")
         self.threshold_window = DoubleVar(value=0.333)
         self.roi_radius = DoubleVar(value=12.0)
+        self.esf_method = StringVar(value="Pixel binning")
         self.linear = BooleanVar(value=False)
         self.invert = BooleanVar(value=False)
         self.single_roi = BooleanVar(value=False)
@@ -467,7 +491,7 @@ class MtfMapperGui(tk.Tk):
 
     def _set_initial_workspace_split(self) -> None:
         try:
-            self.workspace.sashpos(0, max(680, self.workspace.winfo_width() - 390))
+            self.workspace.sashpos(0, max(620, self.workspace.winfo_width() - 470))
             self.after(50, self.fit_preview)
         except tk.TclError:
             pass
@@ -481,7 +505,7 @@ class MtfMapperGui(tk.Tk):
 
     def toggle_dock(self) -> None:
         self.dock_collapsed = not self.dock_collapsed
-        dock_width = 42 if self.dock_collapsed else 390
+        dock_width = 42 if self.dock_collapsed else 470
         try:
             self.workspace.sashpos(0, max(560, self.workspace.winfo_width() - dock_width))
             self.after(50, self.fit_preview)
@@ -544,6 +568,10 @@ class MtfMapperGui(tk.Tk):
         self.preview.bind("<B1-Motion>", self.on_preview_drag)
         self.preview.bind("<ButtonRelease-1>", self.on_preview_release)
         self.preview.bind("<MouseWheel>", self.on_preview_wheel)
+        try:
+            self.preview.bind("<Magnify>", self.on_preview_magnify)
+        except tk.TclError:
+            pass
         self.preview.bind("<Configure>", self.on_preview_configure)
 
     def _build_settings_tabs(self, parent: ttk.Notebook) -> None:
@@ -551,15 +579,21 @@ class MtfMapperGui(tk.Tk):
         self.setup_tab = ttk.Frame(parent)
         self.advanced_tab = ttk.Frame(parent)
         parent.add(self.setup_tab, text="Setup")
-        parent.add(self.advanced_tab, text="Advanced")
+        parent.add(self.advanced_tab, text="Adv.")
 
         basic_tab = self.setup_tab
 
         props = ttk.LabelFrame(basic_tab, text="1. Image")
         props.pack(fill=tk.X, pady=(0, 8))
-        self.input_label = ttk.Label(props, text="Input: none", anchor=tk.W)
+        self.input_label = ttk.Label(props, text="Input: none", anchor=tk.W, wraplength=420, justify=tk.LEFT)
         self.input_label.grid(row=0, column=0, sticky="ew", padx=8, pady=4)
-        self.output_label = ttk.Label(props, text=f"Output: {short_path(self.current_output_root)}", anchor=tk.W)
+        self.output_label = ttk.Label(
+            props,
+            text=f"Output: {short_path(self.current_output_root)}",
+            anchor=tk.W,
+            wraplength=420,
+            justify=tk.LEFT,
+        )
         self.output_label.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
         props.columnconfigure(0, weight=1)
 
@@ -604,14 +638,21 @@ class MtfMapperGui(tk.Tk):
         self._labeled_entry(advanced, "Adaptive window", self.threshold_window, 1)
         ttk.Checkbutton(advanced, text="Extended SFR domain", variable=self.full_sfr).grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(advanced, text="Reduced SFR smoothing", variable=self.nosmoothing).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
-        ttk.Checkbutton(advanced, text="Automatically tune detection", variable=self.auto_tune).grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
-        ttk.Label(advanced, text="Quality filter").grid(row=5, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Label(advanced, text="ESF construction").grid(row=4, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Combobox(
+            advanced,
+            textvariable=self.esf_method,
+            values=tuple(ESF_METHOD_VALUES),
+            state="readonly",
+        ).grid(row=4, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Checkbutton(advanced, text="Automatically tune detection", variable=self.auto_tune).grid(row=5, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
+        ttk.Label(advanced, text="Quality filter").grid(row=6, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Combobox(
             advanced,
             textvariable=self.quality_filter,
             values=("All edges", "Good only", "Good + Review"),
             state="readonly",
-        ).grid(row=5, column=1, sticky="ew", padx=8, pady=3)
+        ).grid(row=6, column=1, sticky="ew", padx=8, pady=3)
         advanced.columnconfigure(1, weight=1)
 
         raw = ttk.LabelFrame(self.advanced_tab, text="Raw import")
@@ -642,8 +683,20 @@ class MtfMapperGui(tk.Tk):
         self.results_tab = results_tab
         summary = ttk.Frame(results_tab, padding=(10, 8))
         summary.pack(fill=tk.X)
-        ttk.Label(summary, textvariable=self.summary_title, style="SummaryTitle.TLabel").pack(anchor=tk.W)
-        ttk.Label(summary, textvariable=self.summary_detail, style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 8))
+        ttk.Label(
+            summary,
+            textvariable=self.summary_title,
+            style="SummaryTitle.TLabel",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            summary,
+            textvariable=self.summary_detail,
+            style="Muted.TLabel",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 8))
         stats = ttk.Frame(summary)
         stats.pack(fill=tk.X)
         self._summary_stat(stats, "Edges", self.summary_edges, 0)
@@ -657,26 +710,7 @@ class MtfMapperGui(tk.Tk):
         result_buttons.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Button(result_buttons, text="Open selected", command=self.open_selected_result).pack(side=tk.LEFT)
         ttk.Button(result_buttons, text="Open output folder", command=self.open_output_folder).pack(side=tk.LEFT, padx=(6, 0))
-        self.bottom_tabs.add(results_tab, text="Results")
-
-        sfr_tab = ttk.Frame(self.bottom_tabs)
-        curve_header = ttk.Frame(sfr_tab)
-        curve_header.pack(fill=tk.X, padx=8, pady=(8, 0))
-        ttk.Label(curve_header, textvariable=self.selected_edge, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(curve_header, text="Curve").pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Combobox(
-            curve_header,
-            textvariable=self.curve_type,
-            values=("SFR", "ESF", "LSF"),
-            state="readonly",
-            width=6,
-        ).pack(side=tk.LEFT)
-        self.sfr_canvas = tk.Canvas(sfr_tab, background="white", highlightthickness=1, highlightbackground="#c8c8c8")
-        self.sfr_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self.sfr_canvas.bind("<Configure>", lambda _event: self.redraw_selected_curve())
-        self.sfr_canvas.bind("<Motion>", self.on_sfr_hover)
-        self.sfr_canvas.bind("<Leave>", self.on_sfr_leave)
-        self.bottom_tabs.add(sfr_tab, text="Curve Inspector")
+        self.bottom_tabs.add(results_tab, text="Result")
 
         log_tab = ttk.Frame(self.bottom_tabs)
         self.log_text = ScrolledText(log_tab, height=8, wrap=tk.WORD)
@@ -688,7 +722,7 @@ class MtfMapperGui(tk.Tk):
         self.diagnostics_text = ScrolledText(diagnostics_tab, height=8, wrap=tk.WORD)
         self.diagnostics_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.diagnostics_text.config(state=tk.DISABLED)
-        self.bottom_tabs.add(diagnostics_tab, text="Diagnostics")
+        self.bottom_tabs.add(diagnostics_tab, text="Diag.")
 
     def _summary_stat(self, parent: ttk.Frame, label: str, variable: StringVar, column: int) -> None:
         card = ttk.Frame(parent, padding=(10, 4))
@@ -889,6 +923,7 @@ class MtfMapperGui(tk.Tk):
             "threshold_mode": self.threshold_mode.get(),
             "threshold_window": self.threshold_window.get(),
             "roi_radius": self.roi_radius.get(),
+            "esf_method": self.esf_method.get(),
             "linear": self.linear.get(),
             "invert": self.invert.get(),
             "single_roi": self.single_roi.get(),
@@ -1077,7 +1112,7 @@ class MtfMapperGui(tk.Tk):
                     self.selected_measurement = None
                     self.curve_plot_state = None
                     self.selected_edge.set("No edge selected")
-                    self.redraw_selected_curve()
+                    self.close_edge_inspector()
                     self.log(f"Analysis failed for {error.input_path.name}: {error.error}")
                     if error.original_preview_path is not None:
                         self.set_preview_sources(error.original_preview_path, None, [])
@@ -1111,7 +1146,7 @@ class MtfMapperGui(tk.Tk):
         metric = result.measurements[0].mtf_column if result.measurements else self.mtf_metric.get()
         self.summary_title.set(f"{result.input_path.name} - analysis complete")
         if result.measurements:
-            self.summary_detail.set(f"Measured {metric}. Click an annotated edge to inspect its SFR, ESF, and LSF curves.")
+            self.summary_detail.set(f"Measured {metric}. Click an edge to inspect SFR, ESF, and LSF.")
             self.summary_edges.set(str(summary["edges"]))
             self.summary_blocks.set(str(summary["blocks"]))
             self.summary_median.set(f"{summary['median']:.3f}")
@@ -1145,6 +1180,8 @@ class MtfMapperGui(tk.Tk):
             f"Contours: {report.contour_count}   Accepted targets: {report.accepted_count}",
             f"Rejected: {report.rejected_small_area} small, {report.rejected_short_side} short, {report.rejected_shape} non-rectangular",
             f"Edge quality: {counts['Good']} good, {counts['Review']} review, {counts['Poor']} poor",
+            f"ESF methods: {sum(m.esf_method == 'pixel-binned' for m in measurements)} pixel-binned, "
+            f"{sum(m.esf_method == 'interpolated' for m in measurements)} interpolated",
             "",
             *report.suggestions(),
         ]
@@ -1195,7 +1232,7 @@ class MtfMapperGui(tk.Tk):
         self.selected_measurement = None
         self.curve_plot_state = None
         self.selected_edge.set("No edge selected")
-        self.sfr_canvas.delete("all")
+        self.close_edge_inspector()
         self.status.set("Results cleared")
         self.summary_title.set("No analysis yet")
         self.summary_detail.set("Open an image or try the sample chart to see a measurement summary.")
@@ -1350,7 +1387,7 @@ class MtfMapperGui(tk.Tk):
             hint = " - click near an edge to view SFR" if self.preview_measurements else ""
             self.status.set(f"Previewing {self.preview_path.name}{hint}")
             self.preview_info.set(
-                f"{self.preview_path.name}  |  {image_width} x {image_height} px  |  {self.preview_zoom * 100:.0f}%"
+                f"{image_width} x {image_height}  |  {self.preview_zoom * 100:.0f}%"
             )
         except (tk.TclError, ValueError) as exc:
             self.clear_preview(f"Cannot preview {self.preview_path.name}")
@@ -1365,20 +1402,42 @@ class MtfMapperGui(tk.Tk):
         self.preview_zoom = self.preview_fit_scale
         self.render_preview(reset_view=True)
 
-    def zoom_preview(self, factor: float) -> None:
+    def zoom_preview(self, factor: float, anchor_x: int | None = None, anchor_y: int | None = None) -> None:
         if self.preview_path is None:
             return
-        old_x = self.preview.xview()[0]
-        old_y = self.preview.yview()[0]
+        state = self.preview_state
+        if anchor_x is None:
+            anchor_x = self.preview.winfo_width() // 2
+        if anchor_y is None:
+            anchor_y = self.preview.winfo_height() // 2
+        image_anchor: tuple[float, float] | None = None
+        if state is not None:
+            canvas_x = int(self.preview.canvasx(anchor_x))
+            canvas_y = int(self.preview.canvasy(anchor_y))
+            image_anchor = preview_to_image_coords(canvas_x, canvas_y, state)
         self.preview_zoom = min(max(self.preview_zoom * factor, 0.05), 8.0)
         self.render_preview(reset_view=False)
-        self.preview.xview_moveto(old_x)
-        self.preview.yview_moveto(old_y)
+        new_state = self.preview_state
+        if image_anchor is None or new_state is None:
+            return
+        target_x = new_state.offset_x + image_anchor[0] * new_state.display_scale
+        target_y = new_state.offset_y + image_anchor[1] * new_state.display_scale
+        region = self.preview.cget("scrollregion").split()
+        if len(region) == 4:
+            region_width = max(float(region[2]) - float(region[0]), 1.0)
+            region_height = max(float(region[3]) - float(region[1]), 1.0)
+            self.preview.xview_moveto(max(0.0, (target_x - anchor_x) / region_width))
+            self.preview.yview_moveto(max(0.0, (target_y - anchor_y) / region_height))
 
     def on_preview_wheel(self, event: tk.Event) -> None:
         if self.preview_path is None:
             return
-        self.zoom_preview(1.15 if event.delta > 0 else 1 / 1.15)
+        self.zoom_preview(wheel_zoom_factor(float(event.delta)), event.x, event.y)
+
+    def on_preview_magnify(self, event: tk.Event) -> None:
+        if self.preview_path is None:
+            return
+        self.zoom_preview(magnify_zoom_factor(float(event.delta)), event.x, event.y)
 
     def on_preview_configure(self, _event: tk.Event) -> None:
         if self.preview_path is None:
@@ -1467,13 +1526,63 @@ class MtfMapperGui(tk.Tk):
     def show_edge_curves(self, measurement: mtf_mapper_py.EdgeMeasurement) -> None:
         self.selected_measurement = measurement
         self.selected_edge.set(
-            f"Block {measurement.block_id}  Edge ({measurement.edge_x:.1f}, {measurement.edge_y:.1f})  "
-            f"{measurement.mtf_column}={measurement.mtf_value:.4g}  Quality={measurement.quality_label} ({measurement.quality_score:.0%})"
+            f"Block {measurement.block_id} | Edge ({measurement.edge_x:.1f}, {measurement.edge_y:.1f})\n"
+            f"{measurement.mtf_column}={measurement.mtf_value:.4g} | {measurement.quality_label} "
+            f"{measurement.quality_score:.0%} | {measurement.esf_method} ESF"
         )
         self.draw_selected_edge_highlight()
+        self.open_edge_inspector()
         self.redraw_selected_curve()
-        self.show_dock_tab(self.sfr_canvas.master)
         self.status.set(f"Showing {self.curve_type.get()} curve for selected edge")
+
+    def open_edge_inspector(self) -> None:
+        if self.edge_inspector is not None and self.edge_inspector.winfo_exists():
+            self.edge_inspector.deiconify()
+            self.edge_inspector.lift()
+            return
+
+        inspector = tk.Toplevel(self)
+        inspector.title("Edge Inspector")
+        inspector.geometry("760x620")
+        inspector.minsize(560, 420)
+        inspector.protocol("WM_DELETE_WINDOW", self.close_edge_inspector)
+        inspector.bind("<Escape>", lambda _event: self.close_edge_inspector())
+        self.edge_inspector = inspector
+
+        header = ttk.Frame(inspector, padding=(12, 10))
+        header.pack(fill=tk.X)
+        ttk.Label(
+            header,
+            textvariable=self.selected_edge,
+            anchor=tk.W,
+            justify=tk.LEFT,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(header, text="Curve").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Combobox(
+            header,
+            textvariable=self.curve_type,
+            values=("SFR", "ESF", "LSF"),
+            state="readonly",
+            width=6,
+        ).pack(side=tk.LEFT)
+
+        self.sfr_canvas = tk.Canvas(
+            inspector,
+            background="white",
+            highlightthickness=1,
+            highlightbackground="#c8c8c8",
+        )
+        self.sfr_canvas.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        self.sfr_canvas.bind("<Configure>", lambda _event: self.redraw_selected_curve())
+        self.sfr_canvas.bind("<Motion>", self.on_sfr_hover)
+        self.sfr_canvas.bind("<Leave>", self.on_sfr_leave)
+
+    def close_edge_inspector(self) -> None:
+        if self.edge_inspector is not None and self.edge_inspector.winfo_exists():
+            self.edge_inspector.destroy()
+        self.edge_inspector = None
+        self.sfr_canvas = None
+        self.curve_plot_state = None
 
     def draw_selected_edge_highlight(self) -> None:
         self.preview.delete("selected-edge")
@@ -1488,6 +1597,9 @@ class MtfMapperGui(tk.Tk):
         self.preview.create_line(x0, y0, x1, y1, fill="#00ffff", width=5, tags="selected-edge")
 
     def redraw_selected_curve(self) -> None:
+        if self.sfr_canvas is None or not self.sfr_canvas.winfo_exists():
+            self.curve_plot_state = None
+            return
         self.sfr_canvas.delete("all")
         if self.selected_measurement is None:
             self.curve_plot_state = None
@@ -1503,7 +1615,7 @@ class MtfMapperGui(tk.Tk):
 
     def on_sfr_hover(self, event: tk.Event) -> None:
         state = self.curve_plot_state
-        if state is None:
+        if state is None or self.sfr_canvas is None:
             return
         self.sfr_canvas.delete("hover")
         if event.x < state.x0 or event.x > state.x1 or event.y < state.y1 or event.y > state.y0:
@@ -1522,7 +1634,8 @@ class MtfMapperGui(tk.Tk):
         self.sfr_canvas.create_text(label_x, label_y, text=label, anchor=tk.NW, fill="#333333", tags="hover")
 
     def on_sfr_leave(self, _event: tk.Event) -> None:
-        self.sfr_canvas.delete("hover")
+        if self.sfr_canvas is not None:
+            self.sfr_canvas.delete("hover")
 
     def show_about(self) -> None:
         messagebox.showinfo(
