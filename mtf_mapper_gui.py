@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
 import math
 import os
@@ -30,6 +32,12 @@ SUPPORTED_IMAGE_TYPES = [
     ("Raw files", "*.raw *.bin *.dat"),
     ("All files", "*.*"),
 ]
+RAW_FILE_SUFFIXES = {".raw", ".bin", ".dat"}
+THRESHOLD_MODE_VALUES = {
+    "Hybrid (adaptive + global)": "hybrid",
+    "Adaptive only": "adaptive",
+    "Global only": "global",
+}
 PROJECT_DIR = Path(__file__).resolve().parent
 SAMPLE_CHART = PROJECT_DIR / "samples" / "mtf_test_chart.png"
 
@@ -40,6 +48,17 @@ class GuiRunResult:
     output_dir: Path
     edge_count: int
     measurements: list[mtf_mapper_py.EdgeMeasurement]
+    original_preview_path: Path
+    annotated_preview_path: Path
+    heatmap_preview_path: Path | None
+    detection_report: mtf_mapper_py.DetectionReport
+
+
+@dataclass
+class GuiRunError:
+    input_path: Path
+    original_preview_path: Path | None
+    error: Exception
 
 
 @dataclass
@@ -80,13 +99,33 @@ def summarize_measurements(measurements: list[mtf_mapper_py.EdgeMeasurement]) ->
     }
 
 
+def is_raw_input_path(path: Path) -> bool:
+    return path.suffix.lower() in RAW_FILE_SUFFIXES
+
+
+def raw_import_error_message(path: Path, error: Exception) -> str:
+    return (
+        f"Could not open {path.name} using the current Raw import settings.\n\n"
+        "Check Read as raw pixel stream, Width, Height, Data type, Byte order, "
+        "Header bytes, and Channels in Advanced > Raw import, then run analysis again.\n\n"
+        f"Details: {error}"
+    )
+
+
+def normalize_threshold_mode(value: object) -> str:
+    text = str(value)
+    return THRESHOLD_MODE_VALUES.get(text, text)
+
+
 def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[str, object]) -> argparse.Namespace:
     raw_enabled = bool(values.get("raw", False))
     args = argparse.Namespace(
         input_image=str(input_path),
         output_dir=str(output_dir),
         threshold=float(values.get("threshold", 0.55)),
+        threshold_mode=normalize_threshold_mode(values.get("threshold_mode", "hybrid")),
         threshold_window=float(values.get("threshold_window", 1.0 / 3.0)),
+        roi_radius=float(values.get("roi_radius", 12.0)),
         linear=bool(values.get("linear", False)),
         invert=bool(values.get("invert", False)),
         single_roi=bool(values.get("single_roi", False)),
@@ -106,6 +145,9 @@ def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[s
         raw_header=int(values.get("raw_header", 0)),
         raw_channels=int(values.get("raw_channels", 1)),
         log_level=str(values.get("log_level", "INFO")),
+        auto_tune=bool(values.get("auto_tune", False)),
+        manual_boxes=values.get("manual_boxes"),
+        excluded_blocks=values.get("excluded_blocks", []),
     )
     if args.pixelsize in ("", None):
         args.pixelsize = None
@@ -204,6 +246,31 @@ def photo_image_from_cv(path: Path, display_scale: float) -> tuple[tk.PhotoImage
     return tk.PhotoImage(data=data.tobytes(), format="PPM"), width, height, display_width, display_height
 
 
+def prepare_original_preview(input_path: Path, output_dir: Path, values: dict[str, object]) -> Path:
+    if not bool(values.get("raw", False)):
+        return input_path
+    raw_image = mtf_mapper_py.load_raw_image(
+        input_path,
+        width=int(values["raw_width"]),
+        height=int(values["raw_height"]),
+        raw_dtype=str(values.get("raw_dtype", "uint16")),
+        byte_order=str(values.get("raw_byte_order", "little")),
+        header=int(values.get("raw_header", 0)),
+        channels=int(values.get("raw_channels", 1)),
+    )
+    lum, _original = mtf_mapper_py.luminance_from_array(
+        raw_image,
+        linear=True,
+        invert=bool(values.get("invert", False)),
+        apply_srgb_for_uint8=False,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    preview_path = output_dir / "original_preview.png"
+    if not mtf_mapper_py.cv2.imwrite(str(preview_path), mtf_mapper_py.display_copy(lum)):
+        raise ValueError(f"Cannot create original preview for {input_path}")
+    return preview_path
+
+
 def curve_data(
     measurement: mtf_mapper_py.EdgeMeasurement,
     curve_type: str,
@@ -284,6 +351,16 @@ class MtfMapperGui(tk.Tk):
         self.preview_state: PreviewState | None = None
         self.preview_path: Path | None = None
         self.preview_measurements: list[mtf_mapper_py.EdgeMeasurement] = []
+        self.original_preview_path: Path | None = None
+        self.annotated_preview_path: Path | None = None
+        self.annotated_preview_measurements: list[mtf_mapper_py.EdgeMeasurement] = []
+        self.heatmap_preview_path: Path | None = None
+        self.detection_preview_path: Path | None = None
+        self.threshold_preview_path: Path | None = None
+        self.manual_boxes: list[np.ndarray] = []
+        self.excluded_blocks: set[int] = set()
+        self.manual_roi_active = False
+        self.detection_report: mtf_mapper_py.DetectionReport | None = None
         self.preview_zoom = 1.0
         self.preview_fit_scale = 1.0
         self.preview_drag_start: tuple[int, int] | None = None
@@ -291,6 +368,7 @@ class MtfMapperGui(tk.Tk):
         self.curve_plot_state: CurvePlotState | None = None
         self.raw_widgets: list[tk.Widget] = []
         self.current_output_root = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui"
+        self.dock_collapsed = False
 
         self._build_vars()
         self._configure_style()
@@ -301,7 +379,9 @@ class MtfMapperGui(tk.Tk):
 
     def _build_vars(self) -> None:
         self.threshold = DoubleVar(value=0.55)
-        self.threshold_window = DoubleVar(value=1.0 / 3.0)
+        self.threshold_mode = StringVar(value="Hybrid (adaptive + global)")
+        self.threshold_window = DoubleVar(value=0.333)
+        self.roi_radius = DoubleVar(value=12.0)
         self.linear = BooleanVar(value=False)
         self.invert = BooleanVar(value=False)
         self.single_roi = BooleanVar(value=False)
@@ -312,6 +392,8 @@ class MtfMapperGui(tk.Tk):
         self.heatmap = BooleanVar(value=False)
         self.full_sfr = BooleanVar(value=False)
         self.nosmoothing = BooleanVar(value=False)
+        self.auto_tune = BooleanVar(value=False)
+        self.quality_filter = StringVar(value="All edges")
         self.pixelsize = StringVar(value="")
         self.raw = BooleanVar(value=False)
         self.raw_width = StringVar(value="")
@@ -328,9 +410,11 @@ class MtfMapperGui(tk.Tk):
         self.summary_median = StringVar(value="-")
         self.summary_range = StringVar(value="-")
         self.preview_info = StringVar(value="No image")
+        self.preview_mode = StringVar(value="Original")
         self.curve_type = StringVar(value="SFR")
         self.selected_edge = StringVar(value="No edge selected")
         self.raw.trace_add("write", lambda *_args: self._update_raw_controls())
+        self.preview_mode.trace_add("write", lambda *_args: self.show_preview_mode())
         self.curve_type.trace_add("write", lambda *_args: self.redraw_selected_curve())
 
     def _configure_style(self) -> None:
@@ -350,6 +434,11 @@ class MtfMapperGui(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="Choose output directory...", command=self.choose_output_dir)
         file_menu.add_separator()
+        file_menu.add_command(label="Save project...", command=self.save_project)
+        file_menu.add_command(label="Open project...", command=self.open_project)
+        file_menu.add_command(label="Save settings preset...", command=self.save_preset)
+        file_menu.add_command(label="Load settings preset...", command=self.load_preset)
+        file_menu.add_separator()
         file_menu.add_command(label="Exit", accelerator="Ctrl+Q", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
 
@@ -364,22 +453,41 @@ class MtfMapperGui(tk.Tk):
     def _build_layout(self) -> None:
         self._build_toolbar()
 
-        root = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
-
-        sidebar = ttk.Frame(root, width=280)
-        workspace = ttk.PanedWindow(root, orient=tk.VERTICAL)
-        root.add(sidebar, weight=0)
-        root.add(workspace, weight=1)
-
-        self._build_settings_sidebar(sidebar)
+        workspace = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        workspace.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
+        self.workspace = workspace
         self._build_image_panel(workspace)
         self._build_bottom_tabs(workspace)
+        self.after(350, self._set_initial_workspace_split)
         status_bar = ttk.Frame(self)
         status_bar.pack(fill=tk.X, padx=8, pady=(0, 6))
         ttk.Label(status_bar, textvariable=self.status, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=140)
         self.progress.pack(side=tk.RIGHT)
+
+    def _set_initial_workspace_split(self) -> None:
+        try:
+            self.workspace.sashpos(0, max(680, self.workspace.winfo_width() - 390))
+            self.after(50, self.fit_preview)
+        except tk.TclError:
+            pass
+
+    def show_dock_tab(self, tab: ttk.Frame) -> None:
+        self.bottom_tabs.select(tab)
+        if self.dock_collapsed:
+            self.toggle_dock()
+        else:
+            self.after(50, self.fit_preview)
+
+    def toggle_dock(self) -> None:
+        self.dock_collapsed = not self.dock_collapsed
+        dock_width = 42 if self.dock_collapsed else 390
+        try:
+            self.workspace.sashpos(0, max(560, self.workspace.winfo_width() - dock_width))
+            self.after(50, self.fit_preview)
+        except tk.TclError:
+            pass
+        self.dock_button.config(text="Show dock" if self.dock_collapsed else "Hide dock")
 
     def _build_toolbar(self) -> None:
         toolbar = ttk.Frame(self)
@@ -387,6 +495,11 @@ class MtfMapperGui(tk.Tk):
         ttk.Button(toolbar, text="Open", command=self.open_files).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Try sample", command=self.open_sample).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(toolbar, text="Output folder", command=self.choose_output_dir).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(toolbar, text="Preview detection", command=self.preview_detection).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(toolbar, text="Edit ROIs", command=self.edit_rois).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(toolbar, text="Settings", command=lambda: self.show_dock_tab(self.setup_tab)).pack(side=tk.LEFT, padx=(6, 0))
+        self.dock_button = ttk.Button(toolbar, text="Hide dock", command=self.toggle_dock)
+        self.dock_button.pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(toolbar, text="Clear", command=self.clear_results).pack(side=tk.RIGHT)
         self.run_button = ttk.Button(toolbar, text="Run analysis", command=self.run_analysis, style="Primary.TButton")
         self.run_button.pack(side=tk.RIGHT, padx=(0, 8))
@@ -399,6 +512,15 @@ class MtfMapperGui(tk.Tk):
         ttk.Button(controls, text="Zoom +", command=lambda: self.zoom_preview(1.25)).pack(side=tk.LEFT)
         ttk.Button(controls, text="Zoom -", command=lambda: self.zoom_preview(0.8)).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(controls, text="Fit", command=self.fit_preview).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(controls, text="View").pack(side=tk.LEFT, padx=(16, 4))
+        self.preview_mode_box = ttk.Combobox(
+            controls,
+            textvariable=self.preview_mode,
+            values=("Original",),
+            state="readonly",
+            width=10,
+        )
+        self.preview_mode_box.pack(side=tk.LEFT)
         ttk.Label(controls, textvariable=self.preview_info, style="Muted.TLabel", anchor=tk.E).pack(side=tk.RIGHT)
 
         canvas_frame = ttk.Frame(preview_frame)
@@ -424,13 +546,14 @@ class MtfMapperGui(tk.Tk):
         self.preview.bind("<MouseWheel>", self.on_preview_wheel)
         self.preview.bind("<Configure>", self.on_preview_configure)
 
-    def _build_settings_sidebar(self, parent: ttk.Frame) -> None:
-        setup_tabs = ttk.Notebook(parent)
-        setup_tabs.pack(fill=tk.BOTH, expand=True)
-        basic_tab = ttk.Frame(setup_tabs)
-        advanced_tab = ttk.Frame(setup_tabs)
-        setup_tabs.add(basic_tab, text="Setup")
-        setup_tabs.add(advanced_tab, text="Advanced")
+    def _build_settings_tabs(self, parent: ttk.Notebook) -> None:
+        self.setup_tabs = parent
+        self.setup_tab = ttk.Frame(parent)
+        self.advanced_tab = ttk.Frame(parent)
+        parent.add(self.setup_tab, text="Setup")
+        parent.add(self.advanced_tab, text="Advanced")
+
+        basic_tab = self.setup_tab
 
         props = ttk.LabelFrame(basic_tab, text="1. Image")
         props.pack(fill=tk.X, pady=(0, 8))
@@ -458,24 +581,40 @@ class MtfMapperGui(tk.Tk):
             width=12,
         ).grid(row=0, column=1, sticky="ew", padx=8, pady=3)
         self._labeled_entry(measurement, "Target threshold", self.threshold, 1)
-        self._labeled_entry(measurement, "Pixel size (um)", self.pixelsize, 2)
-        self._labeled_entry(measurement, "MTF contrast (%)", self.mtf, 3)
+        self._labeled_entry(measurement, "Edge ROI radius (px)", self.roi_radius, 2)
+        self._labeled_entry(measurement, "Pixel size (um)", self.pixelsize, 3)
+        self._labeled_entry(measurement, "MTF contrast (%)", self.mtf, 4)
         measurement.columnconfigure(1, weight=1)
 
         outputs = ttk.LabelFrame(basic_tab, text="4. Outputs")
-        outputs.pack(fill=tk.X, pady=(0, 8))
+        outputs.pack(fill=tk.X)
         ttk.Checkbutton(outputs, text="Annotated image", variable=self.annotate).grid(row=0, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(outputs, text="CSV tables", variable=self.edges).grid(row=1, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(outputs, text="MTF heat map", variable=self.heatmap).grid(row=2, column=0, sticky=tk.W, padx=8, pady=3)
 
-        advanced = ttk.LabelFrame(advanced_tab, text="Detection and SFR")
+        advanced = ttk.LabelFrame(self.advanced_tab, text="Detection and SFR")
         advanced.pack(fill=tk.X, pady=(0, 8))
-        self._labeled_entry(advanced, "Threshold window", self.threshold_window, 0)
-        ttk.Checkbutton(advanced, text="Extended SFR domain", variable=self.full_sfr).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
-        ttk.Checkbutton(advanced, text="Reduced SFR smoothing", variable=self.nosmoothing).grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
+        ttk.Label(advanced, text="Threshold mode").grid(row=0, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Combobox(
+            advanced,
+            textvariable=self.threshold_mode,
+            values=tuple(THRESHOLD_MODE_VALUES),
+            state="readonly",
+        ).grid(row=0, column=1, sticky="ew", padx=8, pady=3)
+        self._labeled_entry(advanced, "Adaptive window", self.threshold_window, 1)
+        ttk.Checkbutton(advanced, text="Extended SFR domain", variable=self.full_sfr).grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
+        ttk.Checkbutton(advanced, text="Reduced SFR smoothing", variable=self.nosmoothing).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
+        ttk.Checkbutton(advanced, text="Automatically tune detection", variable=self.auto_tune).grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
+        ttk.Label(advanced, text="Quality filter").grid(row=5, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Combobox(
+            advanced,
+            textvariable=self.quality_filter,
+            values=("All edges", "Good only", "Good + Review"),
+            state="readonly",
+        ).grid(row=5, column=1, sticky="ew", padx=8, pady=3)
         advanced.columnconfigure(1, weight=1)
 
-        raw = ttk.LabelFrame(advanced_tab, text="Raw import")
+        raw = ttk.LabelFrame(self.advanced_tab, text="Raw import")
         raw.pack(fill=tk.X)
         raw_enable = ttk.Checkbutton(raw, text="Read as raw pixel stream", variable=self.raw)
         raw_enable.grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
@@ -497,8 +636,10 @@ class MtfMapperGui(tk.Tk):
     def _build_bottom_tabs(self, parent: ttk.PanedWindow) -> None:
         self.bottom_tabs = ttk.Notebook(parent)
         parent.add(self.bottom_tabs, weight=1)
+        self._build_settings_tabs(self.bottom_tabs)
 
         results_tab = ttk.Frame(self.bottom_tabs)
+        self.results_tab = results_tab
         summary = ttk.Frame(results_tab, padding=(10, 8))
         summary.pack(fill=tk.X)
         ttk.Label(summary, textvariable=self.summary_title, style="SummaryTitle.TLabel").pack(anchor=tk.W)
@@ -543,6 +684,12 @@ class MtfMapperGui(tk.Tk):
         self.log_text.config(state=tk.DISABLED)
         self.bottom_tabs.add(log_tab, text="Log")
 
+        diagnostics_tab = ttk.Frame(self.bottom_tabs)
+        self.diagnostics_text = ScrolledText(diagnostics_tab, height=8, wrap=tk.WORD)
+        self.diagnostics_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.diagnostics_text.config(state=tk.DISABLED)
+        self.bottom_tabs.add(diagnostics_tab, text="Diagnostics")
+
     def _summary_stat(self, parent: ttk.Frame, label: str, variable: StringVar, column: int) -> None:
         card = ttk.Frame(parent, padding=(10, 4))
         card.grid(row=0, column=column, sticky="ew", padx=(0, 6))
@@ -570,10 +717,15 @@ class MtfMapperGui(tk.Tk):
         if not filenames:
             return
         self.input_files = [Path(name) for name in filenames]
+        self.manual_boxes = []
+        self.excluded_blocks.clear()
+        self.manual_roi_active = False
+        self.detection_preview_path = None
+        self.threshold_preview_path = None
         self.single_roi.set(False)
         self.input_label.config(text=f"Input: {len(self.input_files)} file(s), {self.input_files[0].name}")
         self.status.set("Image loaded; analysis will start")
-        self.show_image(self.input_files[0], [])
+        self.set_preview_sources(self.input_files[0], None, [])
         if auto_run:
             self.after(50, self.run_analysis)
 
@@ -588,13 +740,18 @@ class MtfMapperGui(tk.Tk):
             messagebox.showerror("Sample missing", f"Sample chart not found:\n{SAMPLE_CHART}")
             return
         self.input_files = [SAMPLE_CHART]
+        self.manual_boxes = []
+        self.excluded_blocks.clear()
+        self.manual_roi_active = False
+        self.detection_preview_path = None
+        self.threshold_preview_path = None
         self.linear.set(True)
         self.single_roi.set(False)
         self.raw.set(False)
         self.input_label.config(text=f"Input: sample, {SAMPLE_CHART.name}")
         self.status.set("Sample loaded; analysis will start")
         self.log(f"Loaded sample chart: {SAMPLE_CHART}")
-        self.show_image(SAMPLE_CHART, [])
+        self.set_preview_sources(SAMPLE_CHART, None, [])
         self.after(50, self.run_analysis)
 
     def choose_output_dir(self) -> None:
@@ -604,6 +761,111 @@ class MtfMapperGui(tk.Tk):
         self.current_output_root = Path(dirname)
         self.output_label.config(text=f"Output: {short_path(self.current_output_root)}")
         self.log(f"Output folder set to: {self.current_output_root}")
+
+    def preview_detection(self) -> None:
+        if not self.input_files:
+            messagebox.showwarning("No input", "Select an input image first.")
+            return
+        try:
+            input_path = self.input_files[0]
+            values = self.current_values()
+            args = namespace_from_gui_values(input_path, self.current_output_root / input_path.stem, values)
+            lum, original = mtf_mapper_py.load_input_luminance(args)
+            if self.auto_tune.get():
+                boxes, report = mtf_mapper_py.auto_tune_detection(lum)
+                self.threshold_mode.set(next((label for label, mode in THRESHOLD_MODE_VALUES.items() if mode == report.threshold_mode), report.threshold_mode))
+                self.threshold.set(report.threshold)
+                self.threshold_window.set(report.threshold_window)
+            else:
+                boxes, report = mtf_mapper_py.detect_boxes_with_diagnostics(
+                    lum, args.threshold, args.threshold_window, args.threshold_mode
+                )
+            self.manual_boxes = boxes
+            self.excluded_blocks.clear()
+            self.manual_roi_active = True
+            preview = mtf_mapper_py.make_detection_preview(lum, original, boxes)
+            preview_dir = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui_previews" / input_path.stem
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            self.detection_preview_path = preview_dir / "detection_preview.png"
+            if not mtf_mapper_py.cv2.imwrite(str(self.detection_preview_path), preview):
+                raise ValueError("Could not create detection preview")
+            mask = mtf_mapper_py.threshold_dark_objects(lum, report.threshold, report.threshold_window, report.threshold_mode)
+            self.threshold_preview_path = preview_dir / "threshold_mask.png"
+            if not mtf_mapper_py.cv2.imwrite(str(self.threshold_preview_path), mask):
+                raise ValueError("Could not create threshold mask preview")
+            self.detection_report = report
+            self.set_diagnostics(report, [])
+            self.set_preview_sources(self.original_preview_path or input_path, self.annotated_preview_path, self.annotated_preview_measurements, "Detection", self.heatmap_preview_path)
+            self.status.set("Detection preview: click a target to include/exclude it; Shift-drag to add an ROI")
+        except Exception as exc:
+            messagebox.showerror("Detection preview failed", str(exc))
+
+    def edit_rois(self) -> None:
+        if not self.manual_boxes:
+            messagebox.showinfo("No ROIs", "Run Preview detection first, or Shift-drag in the detection view to add an ROI.")
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Edit target ROI")
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        roi_number = IntVar(value=1)
+        x_value = DoubleVar()
+        y_value = DoubleVar()
+        width_value = DoubleVar()
+        height_value = DoubleVar()
+
+        ttk.Label(frame, text="Target").grid(row=0, column=0, sticky=tk.W, padx=4, pady=4)
+        selector = ttk.Combobox(frame, textvariable=roi_number, values=tuple(range(1, len(self.manual_boxes) + 1)), state="readonly", width=10)
+        selector.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        for row, (label, variable) in enumerate(
+            (("X", x_value), ("Y", y_value), ("Width", width_value), ("Height", height_value)),
+            start=1,
+        ):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, padx=4, pady=4)
+            ttk.Entry(frame, textvariable=variable, width=16).grid(row=row, column=1, sticky="ew", padx=4, pady=4)
+
+        def load_selected(*_args: object) -> None:
+            box = self.manual_boxes[roi_number.get() - 1]
+            minimum = box.min(axis=0)
+            maximum = box.max(axis=0)
+            x_value.set(round(float(minimum[0]), 2))
+            y_value.set(round(float(minimum[1]), 2))
+            width_value.set(round(float(maximum[0] - minimum[0]), 2))
+            height_value.set(round(float(maximum[1] - minimum[1]), 2))
+
+        def apply_edit() -> None:
+            x, y = x_value.get(), y_value.get()
+            width, height = width_value.get(), height_value.get()
+            if width < 8 or height < 8:
+                messagebox.showwarning("ROI too small", "Width and height must be at least 8 pixels.", parent=dialog)
+                return
+            self.manual_boxes[roi_number.get() - 1] = np.array(
+                [[x, y], [x + width, y], [x + width, y + height], [x, y + height]],
+                dtype=np.float64,
+            )
+            self.refresh_detection_preview()
+
+        def delete_selected() -> None:
+            index = roi_number.get() - 1
+            self.manual_boxes.pop(index)
+            self.excluded_blocks = {
+                block_id - 1 if block_id > index + 1 else block_id
+                for block_id in self.excluded_blocks
+                if block_id != index + 1
+            }
+            dialog.destroy()
+            self.refresh_detection_preview()
+
+        selector.bind("<<ComboboxSelected>>", load_selected)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(buttons, text="Apply", command=apply_edit).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Delete ROI", command=delete_selected).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
+        load_selected()
+        dialog.transient(self)
+        dialog.grab_set()
 
     def _update_raw_controls(self) -> None:
         state = tk.NORMAL if self.raw.get() else tk.DISABLED
@@ -624,7 +886,9 @@ class MtfMapperGui(tk.Tk):
     def current_values(self) -> dict[str, object]:
         return {
             "threshold": self.threshold.get(),
+            "threshold_mode": self.threshold_mode.get(),
             "threshold_window": self.threshold_window.get(),
+            "roi_radius": self.roi_radius.get(),
             "linear": self.linear.get(),
             "invert": self.invert.get(),
             "single_roi": self.single_roi.get(),
@@ -635,6 +899,8 @@ class MtfMapperGui(tk.Tk):
             "heatmap": self.heatmap.get(),
             "full_sfr": self.full_sfr.get(),
             "nosmoothing": self.nosmoothing.get(),
+            "auto_tune": self.auto_tune.get(),
+            "quality_filter": self.quality_filter.get(),
             "pixelsize": self.pixelsize.get(),
             "raw": self.raw.get(),
             "raw_width": self.raw_width.get(),
@@ -646,12 +912,68 @@ class MtfMapperGui(tk.Tk):
             "log_level": "INFO",
         }
 
+    def apply_values(self, values: dict[str, object]) -> None:
+        for name, value in values.items():
+            variable = getattr(self, name, None)
+            if isinstance(variable, tk.Variable):
+                try:
+                    variable.set(value)
+                except tk.TclError:
+                    pass
+
+    def save_preset(self) -> None:
+        filename = filedialog.asksaveasfilename(title="Save settings preset", defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if filename:
+            Path(filename).write_text(json.dumps(self.current_values(), indent=2), encoding="utf-8")
+            self.status.set("Settings preset saved")
+
+    def load_preset(self) -> None:
+        filename = filedialog.askopenfilename(title="Load settings preset", filetypes=[("JSON", "*.json")])
+        if filename:
+            self.apply_values(json.loads(Path(filename).read_text(encoding="utf-8")))
+            self.status.set("Settings preset loaded")
+
+    def save_project(self) -> None:
+        filename = filedialog.asksaveasfilename(title="Save project", defaultextension=".mtfproject", filetypes=[("MTF project", "*.mtfproject")])
+        if not filename:
+            return
+        payload = {
+            "inputs": [str(path) for path in self.input_files],
+            "output_root": str(self.current_output_root),
+            "settings": self.current_values(),
+            "manual_boxes": [box.tolist() for box in self.manual_boxes],
+            "excluded_blocks": sorted(self.excluded_blocks),
+            "manual_roi_active": self.manual_roi_active,
+        }
+        Path(filename).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.status.set("Project saved")
+
+    def open_project(self) -> None:
+        filename = filedialog.askopenfilename(title="Open project", filetypes=[("MTF project", "*.mtfproject"), ("JSON", "*.json")])
+        if not filename:
+            return
+        payload = json.loads(Path(filename).read_text(encoding="utf-8"))
+        self.input_files = [Path(path) for path in payload.get("inputs", [])]
+        self.current_output_root = Path(payload.get("output_root", self.current_output_root))
+        self.apply_values(payload.get("settings", {}))
+        self.manual_boxes = [np.asarray(box, dtype=np.float64) for box in payload.get("manual_boxes", [])]
+        self.excluded_blocks = set(payload.get("excluded_blocks", []))
+        self.manual_roi_active = bool(payload.get("manual_roi_active", bool(self.manual_boxes)))
+        self.input_label.config(text=f"Input: {len(self.input_files)} file(s)" if self.input_files else "Input: none")
+        self.output_label.config(text=f"Output: {short_path(self.current_output_root)}")
+        if self.input_files:
+            self.set_preview_sources(self.input_files[0], None, [])
+        self.status.set("Project loaded")
+
     def run_analysis(self) -> None:
         if not self.input_files:
             messagebox.showwarning("No input", "Select at least one input image first.")
             return
         if not self.annotate.get() and not self.edges.get() and not self.heatmap.get():
             messagebox.showwarning("No outputs", "Select at least one output.")
+            return
+        if self.roi_radius.get() < 4.0:
+            messagebox.showwarning("Invalid ROI size", "Edge ROI radius must be at least 4 pixels.")
             return
         self.run_button.config(state=tk.DISABLED)
         self.progress.start(12)
@@ -660,38 +982,113 @@ class MtfMapperGui(tk.Tk):
         self.summary_detail.set("Detecting targets and calculating edge response.")
         self.log(f"Starting analysis for {len(self.input_files)} file(s)")
         values = self.current_values()
+        manual_active = len(self.input_files) == 1 and self.manual_roi_active
+        values["manual_boxes"] = [box.tolist() for box in self.manual_boxes] if manual_active else None
+        values["excluded_blocks"] = sorted(self.excluded_blocks) if manual_active else []
         thread = threading.Thread(target=self._run_worker, args=(self.input_files.copy(), values), daemon=True)
         thread.start()
 
     def _run_worker(self, files: list[Path], values: dict[str, object]) -> None:
-        try:
-            for input_path in files:
+        for input_path in files:
+            original_preview_path: Path | None = None
+            try:
                 output_dir = self.current_output_root / input_path.stem
+                preview_dir = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui_previews" / input_path.stem
+                original_preview_path = prepare_original_preview(input_path, preview_dir, values)
+                self.worker_queue.put(("original", (input_path, original_preview_path)))
                 args = namespace_from_gui_values(input_path, output_dir, values)
+                lum_for_detection, original_for_detection = mtf_mapper_py.load_input_luminance(args)
+                if args.manual_boxes is not None:
+                    report = mtf_mapper_py.DetectionReport(
+                        "manual", args.threshold, args.threshold_window, accepted_count=len(args.manual_boxes)
+                    )
+                elif args.auto_tune:
+                    _boxes, report = mtf_mapper_py.auto_tune_detection(lum_for_detection)
+                else:
+                    _boxes, report = mtf_mapper_py.detect_boxes_with_diagnostics(
+                        lum_for_detection, args.threshold, args.threshold_window, args.threshold_mode
+                    )
                 lum, annotated, measurements = mtf_mapper_py.analyze_image(args)
+                quality_filter = str(values.get("quality_filter", "All edges"))
+                if quality_filter == "Good only":
+                    measurements = [m for m in measurements if m.quality_label == "Good"]
+                elif quality_filter == "Good + Review":
+                    measurements = [m for m in measurements if m.quality_label != "Poor"]
+                if not measurements:
+                    raise ValueError("All measured edges were removed by the quality filter")
+                annotated = mtf_mapper_py.make_annotation(lum, original_for_detection, measurements)
                 if args.edges:
                     mtf_mapper_py.write_edge_tables(output_dir, measurements)
                 if args.annotate:
                     mtf_mapper_py.write_annotation(output_dir, annotated)
+                    annotated_preview_path = output_dir / "annotated.png"
+                else:
+                    preview_dir.mkdir(parents=True, exist_ok=True)
+                    annotated_preview_path = preview_dir / "annotated_preview.png"
+                    if not mtf_mapper_py.cv2.imwrite(str(annotated_preview_path), annotated):
+                        raise ValueError(f"Cannot create annotated preview for {input_path}")
                 if args.heatmap:
                     mtf_mapper_py.write_heatmap(output_dir, lum, measurements)
-                self.worker_queue.put(("result", GuiRunResult(input_path, output_dir, len(measurements), measurements)))
-            self.worker_queue.put(("done", None))
-        except Exception as exc:
-            self.worker_queue.put(("error", exc))
+                    heatmap_preview_path = output_dir / "mtf_heatmap.png"
+                else:
+                    heatmap_preview_path = None
+                mtf_mapper_py.write_diagnostics(output_dir, report, measurements)
+                self.worker_queue.put(
+                    (
+                        "result",
+                        GuiRunResult(
+                            input_path,
+                            output_dir,
+                            len(measurements),
+                            measurements,
+                            original_preview_path,
+                            annotated_preview_path,
+                            heatmap_preview_path,
+                            report,
+                        ),
+                    )
+                )
+            except Exception as exc:
+                self.worker_queue.put(("error", GuiRunError(input_path, original_preview_path, exc)))
+        self.worker_queue.put(("done", None))
 
     def _poll_worker_queue(self) -> None:
         try:
             while True:
                 kind, payload = self.worker_queue.get_nowait()
-                if kind == "result":
+                if kind == "original":
+                    _input_path, original_preview_path = payload  # type: ignore[misc]
+                    self.set_preview_sources(original_preview_path, None, [])
+                elif kind == "result":
                     self.add_result(payload)  # type: ignore[arg-type]
                 elif kind == "error":
-                    self.run_button.config(state=tk.NORMAL)
-                    self.progress.stop()
-                    self.status.set("Analysis failed")
-                    self.log(f"Analysis failed: {payload}")
-                    messagebox.showerror("Analysis failed", str(payload))
+                    error = payload  # type: ignore[assignment]
+                    raw_input_failed = is_raw_input_path(error.input_path)
+                    self.status.set("Check Raw import settings" if raw_input_failed else "Analysis failed")
+                    self.summary_title.set(f"{error.input_path.name} - analysis failed")
+                    if raw_input_failed:
+                        self.summary_detail.set("Check the Raw import metadata in Advanced, then run analysis again.")
+                    else:
+                        self.summary_detail.set("The original image is still available. Adjust the settings and run again.")
+                    self.summary_edges.set("-")
+                    self.summary_blocks.set("-")
+                    self.summary_median.set("-")
+                    self.summary_range.set("-")
+                    self.selected_measurement = None
+                    self.curve_plot_state = None
+                    self.selected_edge.set("No edge selected")
+                    self.redraw_selected_curve()
+                    self.log(f"Analysis failed for {error.input_path.name}: {error.error}")
+                    if error.original_preview_path is not None:
+                        self.set_preview_sources(error.original_preview_path, None, [])
+                    if raw_input_failed:
+                        self.show_dock_tab(self.advanced_tab)
+                        messagebox.showwarning(
+                            "Check Raw import settings",
+                            raw_import_error_message(error.input_path, error.error),
+                        )
+                    else:
+                        messagebox.showerror("Analysis failed", str(error.error))
                 elif kind == "done":
                     self.run_button.config(state=tk.NORMAL)
                     self.progress.stop()
@@ -704,6 +1101,7 @@ class MtfMapperGui(tk.Tk):
     def add_result(self, result: GuiRunResult) -> None:
         parent_id = self.result_tree.insert("", tk.END, text=f"{result.input_path.name} ({result.edge_count} edges)")
         self.result_measurements[result.output_dir] = result.measurements
+        self.detection_report = result.detection_report
         for path in sorted(result.output_dir.glob("*")):
             item_id = self.result_tree.insert(parent_id, tk.END, text=path.name)
             self.result_rows[item_id] = path
@@ -724,14 +1122,55 @@ class MtfMapperGui(tk.Tk):
             self.summary_blocks.set("0")
             self.summary_median.set("-")
             self.summary_range.set("-")
-        self.bottom_tabs.select(0)
-        annotated = result.output_dir / "annotated.png"
-        if annotated.exists():
-            self.show_image(annotated, result.measurements)
-        else:
-            heatmap = result.output_dir / "mtf_heatmap.png"
-            if heatmap.exists():
-                self.show_image(heatmap, result.measurements)
+        self.show_dock_tab(self.results_tab)
+        self.set_diagnostics(result.detection_report, result.measurements)
+        self.set_preview_sources(
+            result.original_preview_path,
+            result.annotated_preview_path,
+            result.measurements,
+            "Annotated",
+            result.heatmap_preview_path,
+        )
+        self.after(100, self.fit_preview)
+        self.write_batch_summary()
+
+    def set_diagnostics(
+        self,
+        report: mtf_mapper_py.DetectionReport,
+        measurements: list[mtf_mapper_py.EdgeMeasurement],
+    ) -> None:
+        counts = {label: sum(m.quality_label == label for m in measurements) for label in ("Good", "Review", "Poor")}
+        lines = [
+            f"Mode: {report.threshold_mode}   Threshold: {report.threshold:.3f}   Window: {report.threshold_window:.3f}",
+            f"Contours: {report.contour_count}   Accepted targets: {report.accepted_count}",
+            f"Rejected: {report.rejected_small_area} small, {report.rejected_short_side} short, {report.rejected_shape} non-rectangular",
+            f"Edge quality: {counts['Good']} good, {counts['Review']} review, {counts['Poor']} poor",
+            "",
+            *report.suggestions(),
+        ]
+        self.diagnostics_text.config(state=tk.NORMAL)
+        self.diagnostics_text.delete("1.0", tk.END)
+        self.diagnostics_text.insert(tk.END, "\n".join(lines))
+        self.diagnostics_text.config(state=tk.DISABLED)
+
+    def write_batch_summary(self) -> None:
+        if len(self.result_measurements) < 2:
+            return
+        self.current_output_root.mkdir(parents=True, exist_ok=True)
+        with (self.current_output_root / "batch_summary.csv").open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
+            writer.writerow(["output", "edges", "blocks", "median", "minimum", "maximum", "good_edges"])
+            for output_dir, measurements in self.result_measurements.items():
+                summary = summarize_measurements(measurements)
+                writer.writerow([
+                    output_dir.name,
+                    summary["edges"],
+                    summary["blocks"],
+                    summary["median"],
+                    summary["minimum"],
+                    summary["maximum"],
+                    sum(m.quality_label == "Good" for m in measurements),
+                ])
 
     def clear_results(self) -> None:
         self.result_tree.delete(*self.result_tree.get_children())
@@ -742,6 +1181,17 @@ class MtfMapperGui(tk.Tk):
         self.preview_state = None
         self.preview_path = None
         self.preview_measurements = []
+        self.original_preview_path = None
+        self.annotated_preview_path = None
+        self.annotated_preview_measurements = []
+        self.heatmap_preview_path = None
+        self.detection_preview_path = None
+        self.threshold_preview_path = None
+        self.manual_boxes = []
+        self.excluded_blocks.clear()
+        self.manual_roi_active = False
+        self.preview_mode.set("Original")
+        self.preview_mode_box.configure(values=("Original",))
         self.selected_measurement = None
         self.curve_plot_state = None
         self.selected_edge.set("No edge selected")
@@ -795,6 +1245,48 @@ class MtfMapperGui(tk.Tk):
         canvas_width = max(self.preview.winfo_width() - 18, 320)
         canvas_height = max(self.preview.winfo_height() - 18, 220)
         return max(0.05, min(canvas_width / image_width, canvas_height / image_height, 1.0))
+
+    def set_preview_sources(
+        self,
+        original_path: Path,
+        annotated_path: Path | None,
+        measurements: list[mtf_mapper_py.EdgeMeasurement],
+        preferred_mode: str = "Original",
+        heatmap_path: Path | None = None,
+    ) -> None:
+        self.original_preview_path = original_path
+        self.annotated_preview_path = annotated_path
+        self.annotated_preview_measurements = measurements
+        self.heatmap_preview_path = heatmap_path
+        modes = ["Original"]
+        if annotated_path is not None:
+            modes.append("Annotated")
+        if heatmap_path is not None:
+            modes.append("Spatial map")
+        if self.detection_preview_path is not None:
+            modes.append("Detection")
+        if self.threshold_preview_path is not None:
+            modes.append("Threshold mask")
+        modes = tuple(modes)
+        self.preview_mode_box.configure(values=modes)
+        mode = preferred_mode if preferred_mode in modes else "Original"
+        if self.preview_mode.get() == mode:
+            self.show_preview_mode()
+        else:
+            self.preview_mode.set(mode)
+
+    def show_preview_mode(self) -> None:
+        mode = self.preview_mode.get()
+        if mode == "Annotated" and self.annotated_preview_path is not None:
+            self.show_image(self.annotated_preview_path, self.annotated_preview_measurements)
+        elif mode == "Spatial map" and self.heatmap_preview_path is not None:
+            self.show_image(self.heatmap_preview_path, [])
+        elif mode == "Detection" and self.detection_preview_path is not None:
+            self.show_image(self.detection_preview_path, [])
+        elif mode == "Threshold mask" and self.threshold_preview_path is not None:
+            self.show_image(self.threshold_preview_path, [])
+        elif self.original_preview_path is not None:
+            self.show_image(self.original_preview_path, [])
 
     def show_image(self, path: Path, measurements: list[mtf_mapper_py.EdgeMeasurement] | None = None) -> None:
         self.preview_path = path
@@ -851,6 +1343,7 @@ class MtfMapperGui(tk.Tk):
                 width=1,
             )
             self.preview.configure(scrollregion=(0, 0, scroll_width, scroll_height))
+            self.draw_selected_edge_highlight()
             if reset_view:
                 self.preview.xview_moveto(0.0)
                 self.preview.yview_moveto(0.0)
@@ -905,13 +1398,42 @@ class MtfMapperGui(tk.Tk):
             return
         start_x, start_y = self.preview_drag_start
         self.preview_drag_start = None
-        if math.hypot(event.x - start_x, event.y - start_y) > 6:
+        drag_distance = math.hypot(event.x - start_x, event.y - start_y)
+        if drag_distance > 6 and (event.state & 0x0001) and self.preview_mode.get() == "Detection":
+            self.add_manual_roi(start_x, start_y, event.x, event.y)
+            return
+        if drag_distance > 6:
             return
         self.on_preview_click(event)
 
+    def add_manual_roi(self, start_x: int, start_y: int, end_x: int, end_y: int) -> None:
+        state = self.preview_state
+        if state is None:
+            return
+        x0, y0 = preview_to_image_coords(int(self.preview.canvasx(start_x)), int(self.preview.canvasy(start_y)), state)
+        x1, y1 = preview_to_image_coords(int(self.preview.canvasx(end_x)), int(self.preview.canvasy(end_y)), state)
+        left, right = sorted((max(0.0, x0), min(float(state.image_width), x1)))
+        top, bottom = sorted((max(0.0, y0), min(float(state.image_height), y1)))
+        if right - left < 8 or bottom - top < 8:
+            return
+        self.manual_boxes.append(np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float64))
+        self.manual_roi_active = True
+        self.refresh_detection_preview()
+
+    def refresh_detection_preview(self) -> None:
+        if not self.input_files:
+            return
+        args = namespace_from_gui_values(self.input_files[0], self.current_output_root / self.input_files[0].stem, self.current_values())
+        lum, original = mtf_mapper_py.load_input_luminance(args)
+        preview = mtf_mapper_py.make_detection_preview(lum, original, self.manual_boxes, sorted(self.excluded_blocks))
+        if self.detection_preview_path is None:
+            return
+        mtf_mapper_py.cv2.imwrite(str(self.detection_preview_path), preview)
+        self.show_image(self.detection_preview_path, [])
+
     def on_preview_click(self, event: tk.Event) -> None:
         state = self.preview_state
-        if state is None or not state.measurements:
+        if state is None:
             return
         canvas_x = int(self.preview.canvasx(event.x))
         canvas_y = int(self.preview.canvasy(event.y))
@@ -919,6 +1441,19 @@ class MtfMapperGui(tk.Tk):
         if image_x < 0 or image_y < 0:
             return
         if image_x > state.image_width or image_y > state.image_height:
+            return
+        if self.preview_mode.get() == "Detection" and self.manual_boxes:
+            block_id = min(
+                range(1, len(self.manual_boxes) + 1),
+                key=lambda idx: float(np.linalg.norm(self.manual_boxes[idx - 1].mean(axis=0) - np.array([image_x, image_y]))),
+            )
+            if block_id in self.excluded_blocks:
+                self.excluded_blocks.remove(block_id)
+            else:
+                self.excluded_blocks.add(block_id)
+            self.refresh_detection_preview()
+            return
+        if not state.measurements:
             return
         measurement = nearest_measurement(state.measurements, image_x, image_y)
         if measurement is None:
@@ -933,11 +1468,24 @@ class MtfMapperGui(tk.Tk):
         self.selected_measurement = measurement
         self.selected_edge.set(
             f"Block {measurement.block_id}  Edge ({measurement.edge_x:.1f}, {measurement.edge_y:.1f})  "
-            f"{measurement.mtf_column}={measurement.mtf_value:.4g}"
+            f"{measurement.mtf_column}={measurement.mtf_value:.4g}  Quality={measurement.quality_label} ({measurement.quality_score:.0%})"
         )
+        self.draw_selected_edge_highlight()
         self.redraw_selected_curve()
-        self.bottom_tabs.select(self.sfr_canvas.master)
+        self.show_dock_tab(self.sfr_canvas.master)
         self.status.set(f"Showing {self.curve_type.get()} curve for selected edge")
+
+    def draw_selected_edge_highlight(self) -> None:
+        self.preview.delete("selected-edge")
+        state = self.preview_state
+        measurement = self.selected_measurement
+        if state is None or measurement is None or measurement not in state.measurements:
+            return
+        x0 = state.offset_x + measurement.edge_start_x * state.display_scale
+        y0 = state.offset_y + measurement.edge_start_y * state.display_scale
+        x1 = state.offset_x + measurement.edge_end_x * state.display_scale
+        y1 = state.offset_y + measurement.edge_end_y * state.display_scale
+        self.preview.create_line(x0, y0, x1, y1, fill="#00ffff", width=5, tags="selected-edge")
 
     def redraw_selected_curve(self) -> None:
         self.sfr_canvas.delete("all")

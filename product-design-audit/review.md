@@ -29,6 +29,21 @@ edges or exported files when more detail is needed.
 6. `05-esf-curve-inspector.png` - Expanded edge inspection. Healthy: users can
    switch between SFR, ESF, and LSF while preserving edge context and hover
    readouts.
+7. `06-original-annotated-switch.png` - Preview comparison. Healthy: users can
+   switch directly between the source image and measured annotation.
+8. `07-original-preview-analysis-failure.png` - Analysis failure. Healthy: the
+   original remains visible, Annotated is unavailable, and the result area
+   explains how to recover.
+9. `08-adaptive-threshold-roi-settings.png` - Adjustable detection settings.
+   Healthy: threshold strategy and adaptive window are exposed while ROI size
+   remains in the primary measurement setup.
+10. `09-detection-preview-workflow.png` - Detection review. Healthy: numbered
+    targets make automatic detection inspectable before analysis.
+11. `10-image-first-layout.png` - Image-first workspace. Healthy: the preview
+    spans the full window while settings remain accessible in a lower dock.
+12. `11-widescreen-side-layout.png` - Widescreen workspace. Healthy: common
+    4:3 and square images preserve their vertical size while curves and settings
+    remain visible in a right-side dock.
 
 ## Strengths
 
@@ -43,7 +58,6 @@ edges or exported files when more detail is needed.
   in the interface.
 - The summary reports distribution facts, but does not yet say whether a result
   is acceptable for a user's lens, sensor, or test standard.
-- Batch analysis summarizes only the most recently completed image.
 - Result files still require users to know which artifact answers which
   question.
 
@@ -68,12 +82,21 @@ edges or exported files when more detail is needed.
 - Removed redundant introductory copy and added a clear image-frame outline.
 - Replaced the annotation color with vivid magenta and strengthened label
   strokes for clearer fit-to-window viewing.
+- Added detection preview with numbered target outlines, click-to-exclude, and
+  Shift-drag manual ROI creation.
+- Added automatic detection tuning, candidate diagnostics, per-edge quality
+  scoring and filtering, spatial-map preview, batch summaries, presets, and
+  reusable project files.
+- Replaced the permanent settings sidebar with a collapsible lower dock,
+  substantially increasing the preview area.
+- Moved the collapsible dock to the right for widescreen displays, allowing
+  4:3 and square previews to use the window height more effectively.
 
 ## Recommended Next Pass
 
-Add short metric explanations and a result-quality framework that users can
-configure for their own test standard. For batch workflows, add a comparison
-table with one row per image and sortable summary metrics.
+Add short metric explanations and configurable pass/fail thresholds for a
+user's own test standard. Turn the generated batch summary into an interactive,
+sortable comparison table.
 
 ## Evidence Limits
 

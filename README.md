@@ -31,6 +31,16 @@ Nyquist frequency divided by 4. Use `--mtf-metric mtf_ny2` for Nyquist/2, or
 Add `--heatmap` to write `mtf_heatmap.png`, a field-of-view map interpolated
 from the measured edge MTF values.
 
+Target detection defaults to `--threshold-mode hybrid`, which combines adaptive
+and global thresholding. Use `--threshold-mode adaptive` for uneven illumination
+or mid-gray targets, or `--threshold-mode global` for a fixed cutoff only.
+Use `--roi-radius` to control the cross-edge sampling radius used for ESF, LSF,
+and SFR calculations.
+Add `--auto-tune` to search the available threshold modes, thresholds, and
+adaptive-window sizes automatically. Every command-line run also writes
+`analysis_diagnostics.json` with detection counts, suggestions, and per-edge
+quality scores.
+
 ## GUI
 
 ```bash
@@ -41,13 +51,36 @@ The GUI keeps the original C++ app's basic workflow, organized into a compact
 workspace:
 
 - top toolbar for opening files, loading the sample chart, choosing output, and running analysis
-- left sidebar for input, measurement, output, advanced, and raw import settings
-- central annotated image preview
-- lower tabs for results, curve inspection, and log output
+- full-width image preview as the primary workspace
+- collapsible right dock for setup, advanced settings, results, curve inspection, logs, and diagnostics
+
+Use **Settings** to open the Setup dock and **Hide dock** to give the image
+nearly the full window. The divider can also be dragged to choose the preferred
+preview-to-dock balance. This side-by-side layout preserves vertical space for
+the common square and 4:3 source-image formats on wide monitors.
+
+Use the preview's View selector to switch between the original and annotated
+image after analysis. The original image remains available when analysis fails.
+The Measurement section exposes the edge ROI radius, while Advanced offers
+Hybrid, Adaptive only, and Global only target-detection modes.
 
 When an annotated image is shown, click near an annotated edge/ROI to update
 the docked curve inspector. Switch between SFR, ESF, and LSF, then hover over
 the curve to show a dashed vertical readout line with the corresponding values.
+The selected edge is highlighted on the image and its quality score is shown in
+the inspector.
+
+Use **Preview detection** before analysis to inspect the detected targets.
+Click a target to include or exclude it, or Shift-drag on the image to add a
+rectangular ROI. **Edit ROIs** lets you move, resize, or delete a target.
+Advanced settings can automatically tune detection and filter out low-quality
+edges. The Diagnostics tab explains rejected candidates and suggests
+adjustments, and the View selector can show the threshold mask.
+
+Enable **MTF heat map** to make a Spatial map view available beside Original
+and Annotated. Opening multiple files produces a `batch_summary.csv` comparison
+in the selected output folder. File menu commands save and load reusable
+settings presets and complete `.mtfproject` sessions.
 
 ## Sample Image
 
@@ -74,6 +107,10 @@ uv run mtf-mapper-py image.raw out \
   --raw-dtype uint16 \
   --raw-byte-order little
 ```
+
+In the GUI, a failed `.raw`, `.bin`, or `.dat` import opens the Advanced tab
+and prompts you to verify the Raw import dimensions, data type, byte order,
+header bytes, and channel count.
 
 ## Test
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import math
 import sys
@@ -60,6 +61,35 @@ class EdgeMeasurement:
     esf: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
     lsf: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
     sample_spacing: float = 1.0
+    quality_score: float = 0.0
+    quality_label: str = "Unknown"
+    quality_notes: tuple[str, ...] = ()
+
+
+@dataclass
+class DetectionReport:
+    threshold_mode: str
+    threshold: float
+    threshold_window: float
+    contour_count: int = 0
+    accepted_count: int = 0
+    rejected_small_area: int = 0
+    rejected_short_side: int = 0
+    rejected_shape: int = 0
+
+    def suggestions(self) -> list[str]:
+        if self.threshold_mode == "manual":
+            return ["Using manually selected target regions."]
+        suggestions: list[str] = []
+        if self.contour_count == 0:
+            suggestions.append("Try Adaptive only for uneven illumination or adjust the target threshold.")
+        if self.rejected_small_area:
+            suggestions.append("Targets may be too small; use a higher-resolution image or crop closer.")
+        if self.rejected_shape:
+            suggestions.append("Some candidates were not rectangular; improve target contrast or framing.")
+        if not suggestions and self.accepted_count:
+            suggestions.append("Detection looks healthy.")
+        return suggestions
 
 
 @dataclass
@@ -214,7 +244,12 @@ def odd_window(size: int) -> int:
     return size
 
 
-def threshold_dark_objects(lum: np.ndarray, threshold: float, threshold_window: float) -> np.ndarray:
+def threshold_dark_objects(
+    lum: np.ndarray,
+    threshold: float,
+    threshold_window: float,
+    threshold_mode: str = "hybrid",
+) -> np.ndarray:
     require_cv2()
     img8 = np.clip(lum * 255.0, 0, 255).astype(np.uint8)
     win = odd_window(round(min(lum.shape[:2]) * threshold_window))
@@ -227,7 +262,12 @@ def threshold_dark_objects(lum: np.ndarray, threshold: float, threshold_window: 
         3,
     )
     global_mask = (lum < threshold).astype(np.uint8) * 255
-    mask = cv2.bitwise_and(adaptive, global_mask)
+    if threshold_mode == "adaptive":
+        mask = adaptive
+    elif threshold_mode == "global":
+        mask = global_mask
+    else:
+        mask = cv2.bitwise_and(adaptive, global_mask)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -240,27 +280,60 @@ def order_box_points(points: np.ndarray) -> np.ndarray:
     return points[np.argsort(angles)]
 
 
-def detect_boxes(lum: np.ndarray, threshold: float, threshold_window: float) -> list[np.ndarray]:
+def detect_boxes(
+    lum: np.ndarray,
+    threshold: float,
+    threshold_window: float,
+    threshold_mode: str = "hybrid",
+) -> list[np.ndarray]:
+    boxes, _report = detect_boxes_with_diagnostics(lum, threshold, threshold_window, threshold_mode)
+    return boxes
+
+
+def detect_boxes_with_diagnostics(
+    lum: np.ndarray,
+    threshold: float,
+    threshold_window: float,
+    threshold_mode: str = "hybrid",
+) -> tuple[list[np.ndarray], DetectionReport]:
     require_cv2()
-    mask = threshold_dark_objects(lum, threshold, threshold_window)
+    mask = threshold_dark_objects(lum, threshold, threshold_window, threshold_mode)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     image_area = lum.shape[0] * lum.shape[1]
+    report = DetectionReport(threshold_mode, threshold, threshold_window, contour_count=len(contours))
     boxes: list[np.ndarray] = []
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < max(60.0, image_area * 0.00005):
+            report.rejected_small_area += 1
             continue
         rect = cv2.minAreaRect(contour)
         (_, _), (width, height), _ = rect
         if min(width, height) < 8:
+            report.rejected_short_side += 1
             continue
         rectangularity = area / max(width * height, 1.0)
         if rectangularity < 0.55:
+            report.rejected_shape += 1
             LOGGER.warning("skipping low-rectangularity contour with score %.2f", rectangularity)
             continue
         boxes.append(order_box_points(cv2.boxPoints(rect).astype(np.float64)))
     boxes.sort(key=lambda box: (box[:, 1].mean(), box[:, 0].mean()))
-    return boxes
+    report.accepted_count = len(boxes)
+    return boxes, report
+
+
+def auto_tune_detection(lum: np.ndarray) -> tuple[list[np.ndarray], DetectionReport]:
+    candidates: list[tuple[float, list[np.ndarray], DetectionReport]] = []
+    for mode in ("hybrid", "adaptive", "global"):
+        for threshold in (0.4, 0.5, 0.6, 0.7):
+            for window in (0.15, 0.25, 1.0 / 3.0, 0.5):
+                boxes, report = detect_boxes_with_diagnostics(lum, threshold, window, mode)
+                area_score = sum(float(cv2.contourArea(box.astype(np.float32))) for box in boxes)
+                score = len(boxes) * 1000000.0 + area_score - report.rejected_shape * 1000.0
+                candidates.append((score, boxes, report))
+    _score, boxes, report = max(candidates, key=lambda item: item[0])
+    return boxes, report
 
 
 def sample_bilinear(lum: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -407,12 +480,27 @@ def measure_edge(
     full_sfr: bool,
     smooth: bool,
     pixel_size: float | None,
+    roi_radius: float = 12.0,
 ) -> EdgeMeasurement:
-    esf, spacing, edge_contrast = esf_from_edge(lum, p0, p1)
+    esf, spacing, edge_contrast = esf_from_edge(lum, p0, p1, radius=roi_radius)
     freqs, sfr = sfr_from_esf(esf, spacing, smooth=smooth, full_sfr=full_sfr)
     display_esf, display_lsf = edge_profiles_from_esf(esf, spacing, smooth=smooth)
     mtf_value = reported_mtf_value(freqs, sfr, mtf_metric, mtf_contrast, pixel_size)
     center = (p0 + p1) * 0.5
+    angle = folded_edge_angle(p0, p1)
+    notes: list[str] = []
+    if edge_contrast < 0.1:
+        notes.append("low contrast")
+    if angle < 1.0:
+        notes.append("edge angle is nearly axis-aligned")
+    if not math.isfinite(mtf_value):
+        notes.append("reported MTF could not be resolved")
+    quality_score = float(np.clip(edge_contrast / 0.35, 0.0, 1.0))
+    if angle < 1.0:
+        quality_score *= 0.65
+    if not math.isfinite(mtf_value):
+        quality_score *= 0.4
+    quality_label = "Good" if quality_score >= 0.7 else "Review" if quality_score >= 0.4 else "Poor"
     return EdgeMeasurement(
         block_id=block_id,
         edge_x=float(center[0]),
@@ -422,7 +510,7 @@ def measure_edge(
         mtf_column=mtf_metric_column(mtf_metric, pixel_size),
         corner_x=float(corner[0]),
         corner_y=float(corner[1]),
-        edge_angle=folded_edge_angle(p0, p1),
+        edge_angle=angle,
         radial_angle=radial_angle(center, lum.shape),
         sfr=resample_sfr(freqs, sfr, full_sfr),
         quality=edge_contrast,
@@ -433,25 +521,13 @@ def measure_edge(
         esf=display_esf,
         lsf=display_lsf,
         sample_spacing=spacing,
+        quality_score=quality_score,
+        quality_label=quality_label,
+        quality_notes=tuple(notes),
     )
 
 
-def box_edges(box: np.ndarray) -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    for idx in range(4):
-        yield box[idx], box[(idx + 1) % 4], box[idx]
-
-
-def detect_single_roi_box(lum: np.ndarray, threshold: float) -> np.ndarray:
-    mask = (lum < threshold).astype(np.uint8) * 255
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise ValueError("no edge-like object found in single ROI")
-    contour = max(contours, key=cv2.contourArea)
-    rect = cv2.minAreaRect(contour)
-    return order_box_points(cv2.boxPoints(rect).astype(np.float64))
-
-
-def analyze_image(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[EdgeMeasurement]]:
+def load_input_luminance(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
     input_path = Path(args.input_image)
     if args.raw:
         raw_img = load_raw_image(
@@ -463,15 +539,48 @@ def analyze_image(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, lis
             header=args.raw_header,
             channels=args.raw_channels,
         )
-        # ImageJ-style raw imports are scientific pixel data, so treat them as linear intensity.
-        lum, original = luminance_from_array(raw_img, linear=True, invert=args.invert, apply_srgb_for_uint8=False)
+        return luminance_from_array(raw_img, linear=True, invert=args.invert, apply_srgb_for_uint8=False)
+    return load_luminance(input_path, linear=args.linear, invert=args.invert)
+
+
+def box_edges(box: np.ndarray) -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    for idx in range(4):
+        yield box[idx], box[(idx + 1) % 4], box[idx]
+
+
+def detect_single_roi_box(
+    lum: np.ndarray,
+    threshold: float,
+    threshold_window: float = 1.0 / 3.0,
+    threshold_mode: str = "hybrid",
+) -> np.ndarray:
+    mask = threshold_dark_objects(lum, threshold, threshold_window, threshold_mode)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("no edge-like object found in single ROI")
+    contour = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(contour)
+    return order_box_points(cv2.boxPoints(rect).astype(np.float64))
+
+
+def analyze_image(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[EdgeMeasurement]]:
+    lum, original = load_input_luminance(args)
+    manual_boxes = getattr(args, "manual_boxes", None)
+    if manual_boxes is not None:
+        boxes = [np.asarray(box, dtype=np.float64) for box in manual_boxes]
+    elif getattr(args, "auto_tune", False):
+        boxes, report = auto_tune_detection(lum)
+        args.threshold_mode = report.threshold_mode
+        args.threshold = report.threshold
+        args.threshold_window = report.threshold_window
     else:
-        lum, original = load_luminance(input_path, linear=args.linear, invert=args.invert)
-    boxes = [detect_single_roi_box(lum, args.threshold)] if args.single_roi else detect_boxes(
-        lum, args.threshold, args.threshold_window
-    )
+        boxes = [detect_single_roi_box(lum, args.threshold, args.threshold_window, args.threshold_mode)] if args.single_roi else detect_boxes(
+            lum, args.threshold, args.threshold_window, args.threshold_mode
+        )
+    excluded = set(getattr(args, "excluded_blocks", []))
+    boxes = [box for idx, box in enumerate(boxes, start=1) if idx not in excluded]
     if not boxes:
-        raise ValueError("no dark rectangular objects found; try a different --threshold")
+        raise ValueError("no dark rectangular objects found; adjust threshold mode or detection settings")
 
     measurements: list[EdgeMeasurement] = []
     for block_id, box in enumerate(boxes, start=1):
@@ -488,6 +597,7 @@ def analyze_image(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, lis
                     full_sfr=args.full_sfr,
                     smooth=not args.nosmoothing,
                     pixel_size=args.pixelsize,
+                    roi_radius=args.roi_radius,
                 )
             except ValueError as exc:
                 LOGGER.warning("skipping edge in block %d: %s", block_id, exc)
@@ -535,6 +645,29 @@ def make_annotation(lum: np.ndarray, original: np.ndarray, measurements: Sequenc
     return annotated
 
 
+def make_detection_preview(
+    lum: np.ndarray,
+    original: np.ndarray,
+    boxes: Sequence[np.ndarray],
+    excluded_blocks: Sequence[int] = (),
+) -> np.ndarray:
+    require_cv2()
+    if original.ndim == 2:
+        preview = luminance_to_bgr(lum)
+    else:
+        preview = display_copy(original[:, :, :3]).copy()
+    excluded = set(excluded_blocks)
+    for block_id, box in enumerate(boxes, start=1):
+        color = (120, 120, 120) if block_id in excluded else (0, 210, 255)
+        points = np.round(box).astype(np.int32)
+        cv2.polylines(preview, [points], True, color, 3, cv2.LINE_AA)
+        center = tuple(np.round(box.mean(axis=0)).astype(int))
+        label = f"{block_id} excluded" if block_id in excluded else str(block_id)
+        cv2.putText(preview, label, center, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(preview, label, center, cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    return preview
+
+
 def write_edge_tables(output_dir: Path, measurements: Sequence[EdgeMeasurement]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     mtf_path = output_dir / "edge_mtf_values.csv"
@@ -580,6 +713,28 @@ def write_annotation(output_dir: Path, annotated: np.ndarray) -> None:
     out_path = output_dir / "annotated.png"
     if not cv2.imwrite(str(out_path), annotated):
         raise ValueError(f"could not write {out_path}")
+
+
+def write_diagnostics(output_dir: Path, report: DetectionReport, measurements: Sequence[EdgeMeasurement]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "detection": {
+            **report.__dict__,
+            "suggestions": report.suggestions(),
+        },
+        "edge_quality": [
+            {
+                "block_id": m.block_id,
+                "edge_x": m.edge_x,
+                "edge_y": m.edge_y,
+                "score": m.quality_score,
+                "label": m.quality_label,
+                "notes": list(m.quality_notes),
+            }
+            for m in measurements
+        ],
+    }
+    (output_dir / "analysis_diagnostics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def mtf_heatmap_limits(values_source: Sequence[HeatmapBlock | EdgeMeasurement]) -> tuple[float, float]:
@@ -685,7 +840,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("input_image", help="input image file name")
     parser.add_argument("output_dir", help="directory for output files")
     parser.add_argument("-t", "--threshold", type=float, default=0.55, help="dark object threshold in [0,1]")
+    parser.add_argument(
+        "--threshold-mode",
+        default="hybrid",
+        choices=["hybrid", "adaptive", "global"],
+        help="target detection thresholding: adaptive plus global, adaptive only, or global only",
+    )
     parser.add_argument("--threshold-window", type=float, default=1.0 / 3.0, help="adaptive threshold window fraction")
+    parser.add_argument("--roi-radius", type=float, default=12.0, help="edge sampling radius in pixels")
+    parser.add_argument("--auto-tune", action="store_true", help="search threshold modes and values for the strongest detection")
     parser.add_argument("-l", "--linear", action="store_true", help="treat 8-bit input as linear")
     parser.add_argument("--invert", action="store_true", help="invert brightness before processing")
     parser.add_argument("--single-roi", action="store_true", help="treat input as a single cropped edge/target")
@@ -730,6 +893,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--threshold must be in the open interval (0, 1)")
     if not 0.0 < args.threshold_window <= 1.0:
         parser.error("--threshold-window must be in the interval (0, 1]")
+    if args.roi_radius < 4.0:
+        parser.error("--roi-radius must be at least 4 pixels")
     if not 1.0 <= args.mtf <= 99.0:
         parser.error("--mtf must be in the interval [1, 99]")
     if args.pixelsize is not None and args.pixelsize <= 0:
@@ -753,6 +918,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
     try:
+        lum_for_detection, _original = load_input_luminance(args)
+        if args.auto_tune:
+            _boxes, report = auto_tune_detection(lum_for_detection)
+        elif args.single_roi:
+            report = DetectionReport(args.threshold_mode, args.threshold, args.threshold_window, accepted_count=1)
+        else:
+            _boxes, report = detect_boxes_with_diagnostics(
+                lum_for_detection, args.threshold, args.threshold_window, args.threshold_mode
+            )
         lum, annotated, measurements = analyze_image(args)
         output_dir = Path(args.output_dir)
         if args.edges:
@@ -761,6 +935,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_annotation(output_dir, annotated)
         if args.heatmap:
             write_heatmap(output_dir, lum, measurements)
+        write_diagnostics(output_dir, report, measurements)
     except Exception as exc:
         LOGGER.error("%s", exc)
         return 1

@@ -1,4 +1,5 @@
 import csv
+import json
 import math
 import tempfile
 import unittest
@@ -25,6 +26,9 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertFalse(args.heatmap)
         self.assertEqual(args.mtf, 50.0)
         self.assertEqual(args.mtf_metric, "mtf_ny4")
+        self.assertEqual(args.threshold_mode, "hybrid")
+        self.assertEqual(args.roi_radius, 12.0)
+        self.assertFalse(args.auto_tune)
 
     def test_raw_requires_dimensions(self):
         with self.assertRaises(SystemExit):
@@ -36,7 +40,9 @@ class MtfMapperPyTests(unittest.TestCase):
             Path("out"),
             {
                 "threshold": 0.4,
+                "threshold_mode": "adaptive",
                 "threshold_window": 0.25,
+                "roi_radius": 18.0,
                 "linear": True,
                 "invert": True,
                 "single_roi": True,
@@ -66,6 +72,12 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertIsNone(args.pixelsize)
         self.assertEqual(args.mtf_metric, "mtf_ny4")
         self.assertTrue(args.heatmap)
+        self.assertEqual(args.threshold_mode, "adaptive")
+        self.assertEqual(args.roi_radius, 18.0)
+        self.assertEqual(
+            mtf_mapper_gui.normalize_threshold_mode("Hybrid (adaptive + global)"),
+            "hybrid",
+        )
 
     def test_gui_click_helpers(self):
         measurements = [
@@ -111,6 +123,39 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertAlmostEqual(summary["minimum"], 0.2)
         self.assertAlmostEqual(summary["maximum"], 0.9)
 
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_gui_prepares_raw_original_preview(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            raw_path = tmp_path / "tiny.raw"
+            raw_path.write_bytes(np.array([0, 1000, 2000, 3000], dtype="<u2").tobytes())
+            preview_path = mtf_mapper_gui.prepare_original_preview(
+                raw_path,
+                tmp_path / "preview",
+                {
+                    "raw": True,
+                    "raw_width": "2",
+                    "raw_height": "2",
+                    "raw_dtype": "uint16",
+                    "raw_byte_order": "little",
+                    "raw_header": 0,
+                    "raw_channels": 1,
+                    "invert": False,
+                },
+            )
+            self.assertTrue(preview_path.exists())
+            self.assertEqual(mtf_mapper_py.cv2.imread(str(preview_path)).shape[:2], (2, 2))
+
+    def test_gui_raw_import_error_prompt(self):
+        path = Path("capture.RAW")
+        message = mtf_mapper_gui.raw_import_error_message(path, ValueError("raw input ended early"))
+        self.assertTrue(mtf_mapper_gui.is_raw_input_path(path))
+        self.assertIn("current Raw import settings", message)
+        self.assertIn("Width", message)
+        self.assertIn("Byte order", message)
+        self.assertIn("raw input ended early", message)
+        self.assertFalse(mtf_mapper_gui.is_raw_input_path(Path("capture.png")))
+
     def test_load_raw_image_with_header_and_byte_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_path = Path(tmp) / "tiny.raw"
@@ -134,6 +179,49 @@ class MtfMapperPyTests(unittest.TestCase):
         mtf50 = mtf_mapper_py.interpolate_mtf(freqs, sfr, 0.5)
         self.assertTrue(math.isfinite(mtf50))
         self.assertGreater(mtf50, 0.0)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_adaptive_only_threshold_recovers_mid_gray_target(self):
+        lum = np.full((180, 240), 0.82, dtype=np.float64)
+        lum[55:125, 75:165] = 0.68
+        hybrid = mtf_mapper_py.detect_boxes(lum, threshold=0.55, threshold_window=0.3, threshold_mode="hybrid")
+        adaptive = mtf_mapper_py.detect_boxes(lum, threshold=0.55, threshold_window=0.3, threshold_mode="adaptive")
+        self.assertEqual(hybrid, [])
+        self.assertEqual(len(adaptive), 1)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_edge_roi_radius_controls_esf_width(self):
+        lum = np.zeros((80, 100), dtype=np.float64)
+        lum[:, 50:] = 1.0
+        p0 = np.array([50.0, 10.0])
+        p1 = np.array([50.0, 70.0])
+        small_esf, spacing, _contrast = mtf_mapper_py.esf_from_edge(lum, p0, p1, radius=6.0)
+        large_esf, _, _ = mtf_mapper_py.esf_from_edge(lum, p0, p1, radius=18.0)
+        self.assertEqual(spacing, 0.125)
+        self.assertGreater(len(large_esf), len(small_esf))
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_detection_report_and_auto_tune(self):
+        lum = np.full((160, 220), 0.9, dtype=np.float64)
+        lum[50:110, 70:150] = 0.25
+        boxes, report = mtf_mapper_py.detect_boxes_with_diagnostics(lum, 0.55, 0.3, "hybrid")
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(report.accepted_count, 1)
+        tuned_boxes, tuned_report = mtf_mapper_py.auto_tune_detection(lum)
+        self.assertGreaterEqual(len(tuned_boxes), 1)
+        self.assertIn(tuned_report.threshold_mode, {"hybrid", "adaptive", "global"})
+
+    def test_diagnostics_export_includes_quality(self):
+        measurement = mtf_mapper_py.EdgeMeasurement(
+            1, 10.0, 10.0, 0.5, "mtf_ny4", "mtf_ny4", 0.0, 0.0, 4.0, 0.0,
+            np.array([1.0]), 0.8, quality_score=0.9, quality_label="Good",
+        )
+        report = mtf_mapper_py.DetectionReport("hybrid", 0.55, 0.33, contour_count=2, accepted_count=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            mtf_mapper_py.write_diagnostics(Path(tmp), report, [measurement])
+            data = json.loads((Path(tmp) / "analysis_diagnostics.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["detection"]["accepted_count"], 1)
+        self.assertEqual(data["edge_quality"][0]["label"], "Good")
 
     def test_edge_profiles_and_gui_curve_data(self):
         x = np.linspace(-8.0, 8.0, 129)
