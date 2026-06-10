@@ -104,6 +104,17 @@ class DetectionReport:
 
 
 @dataclass
+class RawNormalizationReport:
+    mode: str
+    observed_min: float
+    observed_max: float
+    black_level: float
+    white_level: float
+    effective_bit_depth: int | None = None
+    alignment: str | None = None
+
+
+@dataclass
 class HeatmapBlock:
     block_id: int
     x: float
@@ -168,9 +179,12 @@ def load_raw_image(
         fin.seek(header)
         data = np.fromfile(fin, dtype=dtype, count=expected_values)
     if data.size != expected_values:
+        packed_hint = ""
+        if dtype.itemsize == 2 and data.size < expected_values:
+            packed_hint = " The stream may use packed 10/12/14-bit encoding and need unpacking before import."
         raise ValueError(
             f"raw input ended early; expected {expected_values} values after {header} header bytes, "
-            f"read {data.size}"
+            f"read {data.size}.{packed_hint}"
         )
     if channels == 1:
         return data.reshape((height, width))
@@ -196,6 +210,86 @@ def normalize_image(img: np.ndarray) -> np.ndarray:
     raise ValueError(f"unsupported image dtype {img.dtype}")
 
 
+def infer_raw_encoding(img: np.ndarray) -> tuple[int | None, str | None]:
+    if not np.issubdtype(img.dtype, np.integer):
+        return None, None
+    storage_bits = np.iinfo(img.dtype).bits
+    values = img.astype(np.int64, copy=False).ravel()
+    if values.size == 0 or np.issubdtype(img.dtype, np.signedinteger) and np.min(values) < 0:
+        return None, None
+    observed_max = int(np.max(values))
+    candidates = [bits for bits in (8, 10, 12, 14, 16) if bits <= storage_bits]
+    right_bits = next((bits for bits in candidates if observed_max <= (1 << bits) - 1), storage_bits)
+    if storage_bits > 8:
+        for bits in candidates:
+            shift = storage_bits - bits
+            if shift <= 0:
+                continue
+            sample = values[:: max(1, values.size // 100000)]
+            if np.mean((sample & ((1 << shift) - 1)) == 0) >= 0.98 and observed_max > (1 << bits) - 1:
+                return bits, "left"
+    return right_bits, "right"
+
+
+def normalize_raw_image(
+    img: np.ndarray,
+    mode: str = "auto",
+    bit_depth: int = 16,
+    alignment: str = "right",
+    black_level: float | None = None,
+    white_level: float | None = None,
+) -> tuple[np.ndarray, RawNormalizationReport]:
+    arr = img.astype(np.float64)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        raise ValueError("raw image does not contain finite values")
+    observed = arr[finite]
+    observed_min = float(np.min(observed))
+    observed_max = float(np.max(observed))
+    inferred_bits, inferred_alignment = infer_raw_encoding(img)
+
+    if mode == "auto":
+        if observed.size < 1000:
+            low, high = observed_min, observed_max
+        else:
+            low, high = (float(value) for value in np.percentile(observed, (0.1, 99.9)))
+            if high <= low:
+                low, high = observed_min, observed_max
+    elif mode == "bit-depth":
+        if not np.issubdtype(img.dtype, np.integer):
+            raise ValueError("bit-depth normalization requires an integer raw data type")
+        storage_bits = np.iinfo(img.dtype).bits
+        if bit_depth <= 0 or bit_depth > storage_bits:
+            raise ValueError(f"raw bit depth must be between 1 and the {storage_bits}-bit storage width")
+        low = 0.0
+        high = float(((1 << bit_depth) - 1) << (storage_bits - bit_depth) if alignment == "left" else (1 << bit_depth) - 1)
+    elif mode == "manual":
+        if black_level is None or white_level is None:
+            raise ValueError("manual raw normalization requires black and white levels")
+        low, high = float(black_level), float(white_level)
+    elif mode == "dtype-range":
+        normalized = normalize_image(img)
+        info = np.iinfo(img.dtype) if np.issubdtype(img.dtype, np.integer) else None
+        low = float(info.min) if info is not None else observed_min
+        high = float(info.max) if info is not None else observed_max
+        return normalized, RawNormalizationReport(
+            mode, observed_min, observed_max, low, high, inferred_bits, inferred_alignment
+        )
+    else:
+        raise ValueError(f"unsupported raw normalization mode {mode}")
+
+    if mode == "auto" and high <= low:
+        return np.zeros_like(arr), RawNormalizationReport(
+            mode, observed_min, observed_max, low, high, inferred_bits, inferred_alignment
+        )
+    if not math.isfinite(low) or not math.isfinite(high) or high <= low:
+        raise ValueError(f"raw normalization white level ({high:g}) must be greater than black level ({low:g})")
+    normalized = np.clip((arr - low) / (high - low), 0.0, 1.0)
+    return normalized, RawNormalizationReport(
+        mode, observed_min, observed_max, low, high, inferred_bits, inferred_alignment
+    )
+
+
 def display_copy(img: np.ndarray) -> np.ndarray:
     arr = normalize_image(img)
     return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
@@ -206,6 +300,7 @@ def luminance_from_array(
     linear: bool,
     invert: bool,
     apply_srgb_for_uint8: bool,
+    normalized: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     if img.dtype not in (np.uint8, np.uint16) and not (
         np.issubdtype(img.dtype, np.signedinteger) or np.issubdtype(img.dtype, np.floating)
@@ -213,7 +308,7 @@ def luminance_from_array(
         raise ValueError("invalid image type; numeric 8-bit, 16-bit, signed integer, or float images are supported")
 
     original = img.copy()
-    arr = normalize_image(img)
+    arr = img.astype(np.float64) if normalized else normalize_image(img)
     if arr.ndim == 2:
         lum = arr
     else:
@@ -648,7 +743,28 @@ def load_input_luminance(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarr
             header=args.raw_header,
             channels=args.raw_channels,
         )
-        return luminance_from_array(raw_img, linear=True, invert=args.invert, apply_srgb_for_uint8=False)
+        normalized, report = normalize_raw_image(
+            raw_img,
+            mode=getattr(args, "raw_normalization", "auto"),
+            bit_depth=getattr(args, "raw_bit_depth", 16),
+            alignment=getattr(args, "raw_alignment", "right"),
+            black_level=getattr(args, "raw_black_level", None),
+            white_level=getattr(args, "raw_white_level", None),
+        )
+        args.raw_normalization_report = report
+        LOGGER.info(
+            "raw samples %.6g..%.6g; normalized %.6g..%.6g using %s; likely %s-bit %s-aligned",
+            report.observed_min,
+            report.observed_max,
+            report.black_level,
+            report.white_level,
+            report.mode,
+            report.effective_bit_depth if report.effective_bit_depth is not None else "unknown",
+            report.alignment or "unknown",
+        )
+        return luminance_from_array(
+            normalized, linear=True, invert=args.invert, apply_srgb_for_uint8=False, normalized=True
+        )
     return load_luminance(input_path, linear=args.linear, invert=args.invert)
 
 
@@ -825,7 +941,12 @@ def write_annotation(output_dir: Path, annotated: np.ndarray) -> None:
         raise ValueError(f"could not write {out_path}")
 
 
-def write_diagnostics(output_dir: Path, report: DetectionReport, measurements: Sequence[EdgeMeasurement]) -> None:
+def write_diagnostics(
+    output_dir: Path,
+    report: DetectionReport,
+    measurements: Sequence[EdgeMeasurement],
+    raw_report: RawNormalizationReport | None = None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "detection": {
@@ -846,6 +967,8 @@ def write_diagnostics(output_dir: Path, report: DetectionReport, measurements: S
             for m in measurements
         ],
     }
+    if raw_report is not None:
+        payload["raw_normalization"] = raw_report.__dict__
     (output_dir / "analysis_diagnostics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -1000,6 +1123,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--raw-header", type=int, default=0, help="number of header bytes to skip before pixel data")
     parser.add_argument("--raw-channels", type=int, default=1, choices=[1, 3, 4], help="number of interleaved raw channels")
+    parser.add_argument(
+        "--raw-normalization",
+        default="auto",
+        choices=["auto", "bit-depth", "manual", "dtype-range"],
+        help="map raw samples using robust automatic levels, effective bit depth, manual levels, or the full data type range",
+    )
+    parser.add_argument("--raw-bit-depth", type=int, default=16, choices=[8, 10, 12, 14, 16], help="effective raw bit depth")
+    parser.add_argument("--raw-alignment", default="right", choices=["right", "left"], help="alignment of samples within the storage type")
+    parser.add_argument("--raw-black-level", type=float, help="manual raw black level")
+    parser.add_argument("--raw-white-level", type=float, help="manual raw white level")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 
@@ -1024,7 +1157,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("--raw-width and --raw-height must be positive")
         if args.raw_header < 0:
             parser.error("--raw-header must be zero or positive")
-    elif any(value is not None for value in (args.raw_width, args.raw_height)) or args.raw_header != 0 or args.raw_channels != 1:
+        if args.raw_normalization == "manual" and (args.raw_black_level is None or args.raw_white_level is None):
+            parser.error("--raw-normalization manual requires --raw-black-level and --raw-white-level")
+        if (
+            args.raw_normalization == "manual"
+            and args.raw_black_level is not None
+            and args.raw_white_level is not None
+            and args.raw_white_level <= args.raw_black_level
+        ):
+            parser.error("--raw-white-level must be greater than --raw-black-level")
+    elif (
+        any(value is not None for value in (args.raw_width, args.raw_height, args.raw_black_level, args.raw_white_level))
+        or args.raw_header != 0
+        or args.raw_channels != 1
+        or args.raw_normalization != "auto"
+        or args.raw_bit_depth != 16
+        or args.raw_alignment != "right"
+    ):
         parser.error("raw metadata options require --raw")
     if not args.annotate and not args.edges and not args.heatmap:
         args.annotate = True
@@ -1053,7 +1202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_annotation(output_dir, annotated)
         if args.heatmap:
             write_heatmap(output_dir, lum, measurements)
-        write_diagnostics(output_dir, report, measurements)
+        write_diagnostics(output_dir, report, measurements, getattr(args, "raw_normalization_report", None))
     except Exception as exc:
         LOGGER.error("%s", exc)
         return 1

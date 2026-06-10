@@ -30,6 +30,7 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertEqual(args.roi_radius, 12.0)
         self.assertEqual(args.esf_method, "pixel-binned")
         self.assertFalse(args.auto_tune)
+        self.assertEqual(args.raw_normalization, "auto")
 
     def test_raw_requires_dimensions(self):
         with self.assertRaises(SystemExit):
@@ -63,6 +64,11 @@ class MtfMapperPyTests(unittest.TestCase):
                 "raw_byte_order": "big",
                 "raw_header": 4,
                 "raw_channels": 1,
+                "raw_normalization": "Bit depth",
+                "raw_bit_depth": 12,
+                "raw_alignment": "right",
+                "raw_black_level": "",
+                "raw_white_level": "",
             },
         )
         self.assertEqual(args.input_image, "input.raw")
@@ -71,6 +77,8 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertEqual(args.raw_width, 20)
         self.assertEqual(args.raw_height, 10)
         self.assertEqual(args.raw_byte_order, "big")
+        self.assertEqual(args.raw_normalization, "bit-depth")
+        self.assertEqual(args.raw_bit_depth, 12)
         self.assertIsNone(args.pixelsize)
         self.assertEqual(args.mtf_metric, "mtf_ny4")
         self.assertTrue(args.heatmap)
@@ -183,6 +191,31 @@ class MtfMapperPyTests(unittest.TestCase):
             )
             self.assertEqual(img.shape, (2, 2))
             self.assertEqual(int(img[0, 1]), 256)
+
+    def test_raw_bit_depth_normalization_supports_right_and_left_alignment(self):
+        right = np.array([0, 1023, 2048, 4095], dtype=np.uint16)
+        normalized, report = mtf_mapper_py.normalize_raw_image(right, mode="bit-depth", bit_depth=12)
+        self.assertAlmostEqual(float(normalized[-1]), 1.0)
+        self.assertAlmostEqual(float(normalized[1]), 1023 / 4095)
+        self.assertEqual(report.effective_bit_depth, 12)
+        self.assertEqual(report.alignment, "right")
+
+        left = np.array([0, 512 << 6, 1023 << 6], dtype=np.uint16)
+        normalized, report = mtf_mapper_py.normalize_raw_image(
+            left, mode="bit-depth", bit_depth=10, alignment="left"
+        )
+        self.assertAlmostEqual(float(normalized[-1]), 1.0)
+        self.assertAlmostEqual(float(normalized[1]), 512 / 1023)
+        self.assertEqual(report.effective_bit_depth, 10)
+        self.assertEqual(report.alignment, "left")
+
+    def test_raw_auto_levels_expand_effective_range(self):
+        image = np.full((100, 100), 3500, dtype=np.uint16)
+        image[20:80, 20:80] = 400
+        normalized, report = mtf_mapper_py.normalize_raw_image(image, mode="auto")
+        self.assertAlmostEqual(float(normalized[0, 0]), 1.0)
+        self.assertAlmostEqual(float(normalized[30, 30]), 0.0)
+        self.assertEqual(report.effective_bit_depth, 12)
 
     def test_sfr_interpolation_on_smooth_edge(self):
         x = np.linspace(-8.0, 8.0, 257)
@@ -477,6 +510,37 @@ class MtfMapperPyTests(unittest.TestCase):
             with (output_dir / "edge_mtf_values.csv").open(encoding="utf-8", newline="") as fin:
                 rows = list(csv.DictReader(fin))
             self.assertGreaterEqual(len(rows), 4)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_raw_12_bit_in_uint16_detects_target_with_auto_levels(self):
+        cv2 = mtf_mapper_py.cv2
+        image = np.full((140, 180), 3600, dtype=np.uint16)
+        points = cv2.boxPoints(((90, 70), (70, 46), -6)).astype(np.int32)
+        cv2.fillConvexPoly(image, points, 450)
+        image = cv2.GaussianBlur(image, (0, 0), 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "synthetic_12bit.raw"
+            output_dir = tmp_path / "out"
+            input_path.write_bytes(image.astype("<u2").tobytes())
+            rc = mtf_mapper_py.main(
+                [
+                    str(input_path),
+                    str(output_dir),
+                    "--raw",
+                    "--raw-width",
+                    "180",
+                    "--raw-height",
+                    "140",
+                    "--raw-dtype",
+                    "uint16",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            diagnostics = json.loads((output_dir / "analysis_diagnostics.json").read_text(encoding="utf-8"))
+            self.assertEqual(diagnostics["raw_normalization"]["mode"], "auto")
+            self.assertLessEqual(diagnostics["raw_normalization"]["observed_max"], 4095)
 
 
 if __name__ == "__main__":

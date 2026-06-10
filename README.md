@@ -119,9 +119,16 @@ uv run mtf-mapper-py image.raw out \
   --raw-byte-order little
 ```
 
+Raw samples default to robust automatic black/white levels, so 8-, 10-, or
+12-bit values stored in `uint16` usefully fill the detection range. For known
+formats, use `--raw-normalization bit-depth --raw-bit-depth 12` and add
+`--raw-alignment left` when samples occupy the high bits. Manual black and
+white levels and the legacy full-data-type range are also available.
+
 In the GUI, a failed `.raw`, `.bin`, or `.dat` import opens the Advanced tab
 and prompts you to verify the Raw import dimensions, data type, byte order,
-header bytes, and channel count.
+header bytes, channel count, and level mapping. Packed 10/12/14-bit streams
+must be unpacked before import.
 
 ## Test
 

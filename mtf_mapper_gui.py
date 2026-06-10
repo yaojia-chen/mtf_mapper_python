@@ -43,6 +43,12 @@ ESF_METHOD_VALUES = {
     "Auto fallback": "auto",
     "Interpolated profiles": "interpolated",
 }
+RAW_NORMALIZATION_VALUES = {
+    "Auto levels": "auto",
+    "Bit depth": "bit-depth",
+    "Manual levels": "manual",
+    "Full dtype range": "dtype-range",
+}
 PROJECT_DIR = Path(__file__).resolve().parent
 SAMPLE_CHART = PROJECT_DIR / "samples" / "mtf_test_chart.png"
 
@@ -112,7 +118,8 @@ def raw_import_error_message(path: Path, error: Exception) -> str:
     return (
         f"Could not open {path.name} using the current Raw import settings.\n\n"
         "Check Read as raw pixel stream, Width, Height, Data type, Byte order, "
-        "Header bytes, and Channels in Advanced > Raw import, then run analysis again.\n\n"
+        "Header bytes, Channels, and Levels in Advanced > Raw import, then run analysis again. "
+        "Packed 10/12/14-bit streams must be unpacked before import.\n\n"
         f"Details: {error}"
     )
 
@@ -125,6 +132,11 @@ def normalize_threshold_mode(value: object) -> str:
 def normalize_esf_method(value: object) -> str:
     text = str(value)
     return ESF_METHOD_VALUES.get(text, text)
+
+
+def normalize_raw_normalization(value: object) -> str:
+    text = str(value)
+    return RAW_NORMALIZATION_VALUES.get(text, text)
 
 
 def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[str, object]) -> argparse.Namespace:
@@ -155,6 +167,11 @@ def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[s
         raw_byte_order=str(values.get("raw_byte_order", "little")),
         raw_header=int(values.get("raw_header", 0)),
         raw_channels=int(values.get("raw_channels", 1)),
+        raw_normalization=normalize_raw_normalization(values.get("raw_normalization", "auto")),
+        raw_bit_depth=int(values.get("raw_bit_depth", 16)),
+        raw_alignment=str(values.get("raw_alignment", "right")),
+        raw_black_level=values.get("raw_black_level"),
+        raw_white_level=values.get("raw_white_level"),
         log_level=str(values.get("log_level", "INFO")),
         auto_tune=bool(values.get("auto_tune", False)),
         manual_boxes=values.get("manual_boxes"),
@@ -167,6 +184,8 @@ def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[s
     if raw_enabled:
         args.raw_width = int(args.raw_width)
         args.raw_height = int(args.raw_height)
+        args.raw_black_level = None if args.raw_black_level in ("", None) else float(args.raw_black_level)
+        args.raw_white_level = None if args.raw_white_level in ("", None) else float(args.raw_white_level)
     return args
 
 
@@ -270,21 +289,8 @@ def photo_image_from_cv(path: Path, display_scale: float) -> tuple[tk.PhotoImage
 def prepare_original_preview(input_path: Path, output_dir: Path, values: dict[str, object]) -> Path:
     if not bool(values.get("raw", False)):
         return input_path
-    raw_image = mtf_mapper_py.load_raw_image(
-        input_path,
-        width=int(values["raw_width"]),
-        height=int(values["raw_height"]),
-        raw_dtype=str(values.get("raw_dtype", "uint16")),
-        byte_order=str(values.get("raw_byte_order", "little")),
-        header=int(values.get("raw_header", 0)),
-        channels=int(values.get("raw_channels", 1)),
-    )
-    lum, _original = mtf_mapper_py.luminance_from_array(
-        raw_image,
-        linear=True,
-        invert=bool(values.get("invert", False)),
-        apply_srgb_for_uint8=False,
-    )
+    args = namespace_from_gui_values(input_path, output_dir, values)
+    lum, _original = mtf_mapper_py.load_input_luminance(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     preview_path = output_dir / "original_preview.png"
     if not mtf_mapper_py.cv2.imwrite(str(preview_path), mtf_mapper_py.display_copy(lum)):
@@ -390,6 +396,8 @@ class MtfMapperGui(tk.Tk):
         self.edge_inspector: tk.Toplevel | None = None
         self.sfr_canvas: tk.Canvas | None = None
         self.raw_widgets: list[tk.Widget] = []
+        self.raw_bit_widgets: list[tk.Widget] = []
+        self.raw_manual_widgets: list[tk.Widget] = []
         self.current_output_root = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui"
         self.dock_collapsed = False
 
@@ -426,6 +434,11 @@ class MtfMapperGui(tk.Tk):
         self.raw_byte_order = StringVar(value="little")
         self.raw_header = IntVar(value=0)
         self.raw_channels = IntVar(value=1)
+        self.raw_normalization = StringVar(value="Auto levels")
+        self.raw_bit_depth = IntVar(value=16)
+        self.raw_alignment = StringVar(value="right")
+        self.raw_black_level = StringVar(value="")
+        self.raw_white_level = StringVar(value="")
         self.status = StringVar(value="Ready")
         self.summary_title = StringVar(value="No analysis yet")
         self.summary_detail = StringVar(value="Open an image or try the sample chart to see a measurement summary.")
@@ -438,6 +451,7 @@ class MtfMapperGui(tk.Tk):
         self.curve_type = StringVar(value="SFR")
         self.selected_edge = StringVar(value="No edge selected")
         self.raw.trace_add("write", lambda *_args: self._update_raw_controls())
+        self.raw_normalization.trace_add("write", lambda *_args: self._update_raw_controls())
         self.preview_mode.trace_add("write", lambda *_args: self.show_preview_mode())
         self.curve_type.trace_add("write", lambda *_args: self.redraw_selected_curve())
 
@@ -672,6 +686,26 @@ class MtfMapperGui(tk.Tk):
         self.raw_widgets.extend([dtype_label, dtype_box, order_label, order_box])
         self._labeled_entry(raw, "Header bytes", self.raw_header, 5, store=self.raw_widgets)
         self._labeled_entry(raw, "Channels", self.raw_channels, 6, store=self.raw_widgets)
+        levels_label = ttk.Label(raw, text="Levels")
+        levels_label.grid(row=7, column=0, sticky=tk.W, padx=8, pady=3)
+        levels_box = ttk.Combobox(
+            raw, textvariable=self.raw_normalization, values=tuple(RAW_NORMALIZATION_VALUES), state="readonly"
+        )
+        levels_box.grid(row=7, column=1, sticky="ew", padx=8, pady=3)
+        self.raw_widgets.extend([levels_label, levels_box])
+        depth_label = ttk.Label(raw, text="Bit depth")
+        depth_label.grid(row=8, column=0, sticky=tk.W, padx=8, pady=3)
+        depth_box = ttk.Combobox(raw, textvariable=self.raw_bit_depth, values=(8, 10, 12, 14, 16), state="readonly")
+        depth_box.grid(row=8, column=1, sticky="ew", padx=8, pady=3)
+        align_label = ttk.Label(raw, text="Alignment")
+        align_label.grid(row=9, column=0, sticky=tk.W, padx=8, pady=3)
+        align_box = ttk.Combobox(raw, textvariable=self.raw_alignment, values=("right", "left"), state="readonly")
+        align_box.grid(row=9, column=1, sticky="ew", padx=8, pady=3)
+        self.raw_widgets.extend([depth_label, depth_box, align_label, align_box])
+        self.raw_bit_widgets.extend([depth_label, depth_box, align_label, align_box])
+        self._labeled_entry(raw, "Black level", self.raw_black_level, 10, store=self.raw_manual_widgets)
+        self._labeled_entry(raw, "White level", self.raw_white_level, 11, store=self.raw_manual_widgets)
+        self.raw_widgets.extend(self.raw_manual_widgets)
         raw.columnconfigure(1, weight=1)
 
     def _build_bottom_tabs(self, parent: ttk.PanedWindow) -> None:
@@ -902,12 +936,26 @@ class MtfMapperGui(tk.Tk):
         dialog.grab_set()
 
     def _update_raw_controls(self) -> None:
-        state = tk.NORMAL if self.raw.get() else tk.DISABLED
-        for widget in self.raw_widgets:
+        enabled = self.raw.get()
+
+        def set_enabled(widget: tk.Widget, active: bool) -> None:
+            state = "readonly" if active and isinstance(widget, ttk.Combobox) else tk.NORMAL if active else tk.DISABLED
             try:
                 widget.configure(state=state)
             except tk.TclError:
                 pass
+
+        for widget in self.raw_widgets:
+            set_enabled(widget, enabled)
+        if not enabled:
+            return
+        mode = normalize_raw_normalization(self.raw_normalization.get())
+        for widgets, active in (
+            (self.raw_bit_widgets, mode == "bit-depth"),
+            (self.raw_manual_widgets, mode == "manual"),
+        ):
+            for widget in widgets:
+                set_enabled(widget, active)
 
     def log(self, message: str) -> None:
         if not hasattr(self, "log_text"):
@@ -944,6 +992,11 @@ class MtfMapperGui(tk.Tk):
             "raw_byte_order": self.raw_byte_order.get(),
             "raw_header": self.raw_header.get(),
             "raw_channels": self.raw_channels.get(),
+            "raw_normalization": self.raw_normalization.get(),
+            "raw_bit_depth": self.raw_bit_depth.get(),
+            "raw_alignment": self.raw_alignment.get(),
+            "raw_black_level": self.raw_black_level.get(),
+            "raw_white_level": self.raw_white_level.get(),
             "log_level": "INFO",
         }
 
@@ -1067,7 +1120,9 @@ class MtfMapperGui(tk.Tk):
                     heatmap_preview_path = output_dir / "mtf_heatmap.png"
                 else:
                     heatmap_preview_path = None
-                mtf_mapper_py.write_diagnostics(output_dir, report, measurements)
+                mtf_mapper_py.write_diagnostics(
+                    output_dir, report, measurements, getattr(args, "raw_normalization_report", None)
+                )
                 self.worker_queue.put(
                     (
                         "result",
