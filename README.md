@@ -65,6 +65,9 @@ workspace:
 Opening an image loads it without immediately starting analysis, leaving time
 to preview detection or adjust settings. The sample chart still runs
 automatically as a quick demonstration.
+Raw files use the current Raw import metadata to build the original preview.
+After changing that metadata, click **Reload with Raw settings** instead of
+reopening the file.
 
 Use **Settings** to open the Setup dock and **Hide dock** to give the image
 nearly the full window. The divider can also be dragged to choose the preferred
@@ -72,7 +75,8 @@ preview-to-dock balance. This side-by-side layout preserves vertical space for
 the common square and 4:3 source-image formats on wide monitors.
 The preview supports smooth mouse-wheel and trackpad zoom, including macOS
 pinch gestures when exposed by the installed Tk version. Zoom stays anchored
-under the pointer.
+under the pointer. Preview pixels are cached and rapid touchpad events are
+combined to keep large-image zoom responsive.
 
 Use the preview's View selector to switch between the original and annotated
 image after analysis. The original image remains available when analysis fails.

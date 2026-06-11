@@ -177,6 +177,22 @@ class MtfMapperPyTests(unittest.TestCase):
             self.assertTrue(preview_path.exists())
             self.assertEqual(mtf_mapper_py.cv2.imread(str(preview_path)).shape[:2], (2, 2))
 
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_gui_prepares_standard_original_preview_without_conversion(self):
+        path = Path("image.png")
+        self.assertEqual(mtf_mapper_gui.prepare_original_preview(path, Path("preview"), {"raw": False}), path)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_gui_decodes_preview_source_to_rgb_once_ready_for_cached_resizes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "color.png"
+            bgr = np.zeros((12, 16, 3), dtype=np.uint8)
+            bgr[:, :, 2] = 255
+            self.assertTrue(mtf_mapper_py.cv2.imwrite(str(path), bgr))
+            rgb = mtf_mapper_gui.rgb_image_from_cv(path)
+            self.assertEqual(rgb.shape, (12, 16, 3))
+            self.assertEqual(tuple(rgb[0, 0]), (255, 0, 0))
+
     def test_gui_raw_import_error_prompt(self):
         path = Path("capture.RAW")
         message = mtf_mapper_gui.raw_import_error_message(path, ValueError("raw input ended early"))
@@ -184,6 +200,7 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertIn("current Raw import settings", message)
         self.assertIn("Width", message)
         self.assertIn("Byte order", message)
+        self.assertIn("Reload with Raw settings", message)
         self.assertIn("raw input ended early", message)
         self.assertFalse(mtf_mapper_gui.is_raw_input_path(Path("capture.png")))
 

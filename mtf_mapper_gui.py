@@ -119,7 +119,8 @@ def raw_import_error_message(path: Path, error: Exception) -> str:
     return (
         f"Could not open {path.name} using the current Raw import settings.\n\n"
         "Check Read as raw pixel stream, Width, Height, Data type, Byte order, "
-        "Header bytes, Channels, Channel order, and Levels in Advanced > Raw import, then run analysis again. "
+        "Header bytes, Channels, Channel order, and Levels in Advanced > Raw import, "
+        "then click Reload with Raw settings before running analysis again. "
         "Packed 10/12/14-bit streams must be unpacked before import.\n\n"
         f"Details: {error}"
     )
@@ -267,7 +268,7 @@ def image_size_from_cv(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def photo_image_from_cv(path: Path, display_scale: float) -> tuple[tk.PhotoImage, int, int, int, int]:
+def rgb_image_from_cv(path: Path) -> np.ndarray:
     mtf_mapper_py.require_cv2()
     cv2 = mtf_mapper_py.cv2
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -280,6 +281,12 @@ def photo_image_from_cv(path: Path, display_scale: float) -> tuple[tk.PhotoImage
         rgb = cv2.cvtColor(image8, cv2.COLOR_BGRA2RGB)
     else:
         rgb = cv2.cvtColor(image8[:, :, :3], cv2.COLOR_BGR2RGB)
+    return rgb
+
+
+def photo_image_from_rgb(rgb: np.ndarray, display_scale: float) -> tuple[tk.PhotoImage, int, int, int, int]:
+    mtf_mapper_py.require_cv2()
+    cv2 = mtf_mapper_py.cv2
     height, width = rgb.shape[:2]
     display_width = max(1, int(round(width * display_scale)))
     display_height = max(1, int(round(height * display_scale)))
@@ -287,8 +294,12 @@ def photo_image_from_cv(path: Path, display_scale: float) -> tuple[tk.PhotoImage
     resized = cv2.resize(rgb, (display_width, display_height), interpolation=interpolation)
     ok, data = cv2.imencode(".ppm", resized)
     if not ok:
-        raise ValueError(f"Cannot render preview for {path}")
+        raise ValueError("Cannot render preview image")
     return tk.PhotoImage(data=data.tobytes(), format="PPM"), width, height, display_width, display_height
+
+
+def photo_image_from_cv(path: Path, display_scale: float) -> tuple[tk.PhotoImage, int, int, int, int]:
+    return photo_image_from_rgb(rgb_image_from_cv(path), display_scale)
 
 
 def prepare_original_preview(input_path: Path, output_dir: Path, values: dict[str, object]) -> Path:
@@ -400,6 +411,8 @@ class MtfMapperGui(tk.Tk):
         self.result_measurements: dict[Path, list[mtf_mapper_py.EdgeMeasurement]] = {}
         self.worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.preview_image: tk.PhotoImage | None = None
+        self.preview_rgb: np.ndarray | None = None
+        self.preview_rgb_path: Path | None = None
         self.preview_state: PreviewState | None = None
         self.preview_path: Path | None = None
         self.preview_measurements: list[mtf_mapper_py.EdgeMeasurement] = []
@@ -416,6 +429,10 @@ class MtfMapperGui(tk.Tk):
         self.preview_zoom = 1.0
         self.preview_fit_scale = 1.0
         self.preview_drag_start: tuple[int, int] | None = None
+        self.pending_zoom_factor = 1.0
+        self.pending_zoom_anchor: tuple[int, int] | None = None
+        self.pending_zoom_after: str | None = None
+        self.pending_render_after: str | None = None
         self.selected_measurement: mtf_mapper_py.EdgeMeasurement | None = None
         self.curve_plot_state: CurvePlotState | None = None
         self.edge_inspector: tk.Toplevel | None = None
@@ -612,8 +629,8 @@ class MtfMapperGui(tk.Tk):
         parent.add(preview_frame, weight=4)
         controls = ttk.Frame(preview_frame)
         controls.pack(fill=tk.X, padx=8, pady=(6, 0))
-        ttk.Button(controls, text="Zoom +", command=lambda: self.zoom_preview(1.25)).pack(side=tk.LEFT)
-        ttk.Button(controls, text="Zoom -", command=lambda: self.zoom_preview(0.8)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(controls, text="Zoom +", command=lambda: self.schedule_center_zoom(1.25)).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Zoom -", command=lambda: self.schedule_center_zoom(0.8)).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(controls, text="Fit", command=self.fit_preview).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(controls, text="View").pack(side=tk.LEFT, padx=(16, 4))
         self.preview_mode_box = ttk.Combobox(
@@ -784,6 +801,8 @@ class MtfMapperGui(tk.Tk):
         raw.pack(fill=tk.X)
         raw_enable = ttk.Checkbutton(raw, text="Read as raw pixel stream", variable=self.raw)
         raw_enable.pack(anchor=tk.W, padx=8, pady=4)
+        self.reload_raw_button = ttk.Button(raw, text="Reload with Raw settings", command=self.reload_original_preview)
+        self.reload_raw_button.pack(anchor=tk.W, padx=8, pady=(0, 6))
         self.raw_fields = ttk.Frame(raw)
         self.raw_fields.pack(fill=tk.X)
         self._labeled_entry(self.raw_fields, "Width", self.raw_width, 0, store=self.raw_widgets)
@@ -914,9 +933,10 @@ class MtfMapperGui(tk.Tk):
         self.detection_preview_path = None
         self.threshold_preview_path = None
         self.single_roi.set(False)
+        self.raw.set(is_raw_input_path(self.input_files[0]))
+        self._update_raw_controls()
         self.input_label.config(text=f"Input: {len(self.input_files)} file(s), {self.input_files[0].name}")
-        self.status.set("Image loaded; preview detection or run analysis")
-        self.set_preview_sources(self.input_files[0], None, [])
+        self.reload_original_preview(show_errors=False)
         self.update_workflow_actions()
         if auto_run:
             self.after(50, self.run_analysis)
@@ -946,6 +966,30 @@ class MtfMapperGui(tk.Tk):
         self.set_preview_sources(SAMPLE_CHART, None, [])
         self.update_workflow_actions()
         self.after(50, self.run_analysis)
+
+    def reload_original_preview(self, show_errors: bool = True) -> None:
+        if not self.input_files:
+            return
+        input_path = self.input_files[0]
+        preview_dir = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui_previews" / input_path.stem
+        try:
+            original_path = prepare_original_preview(input_path, preview_dir, self.current_values())
+            self.detection_preview_path = None
+            self.threshold_preview_path = None
+            self.set_preview_sources(original_path, None, [])
+            self.status.set("Image reloaded with current settings; preview detection or run analysis")
+            self.log(f"Reloaded image preview: {input_path.name}")
+        except Exception as exc:
+            self.original_preview_path = None
+            self.preview_path = None
+            self.preview_rgb = None
+            self.preview_rgb_path = None
+            self.clear_preview("Set Raw import metadata, then click Reload with Raw settings")
+            self.status.set("Check Raw import settings, then reload image")
+            self.show_dock_tab(self.advanced_tab)
+            self.log(f"Could not reload {input_path.name}: {exc}")
+            if show_errors:
+                messagebox.showwarning("Check Raw import settings", raw_import_error_message(input_path, exc))
 
     def choose_output_dir(self) -> None:
         dirname = filedialog.askdirectory(title="Select output directory")
@@ -1084,6 +1128,9 @@ class MtfMapperGui(tk.Tk):
 
     def _update_raw_controls(self) -> None:
         enabled = self.raw.get()
+        if hasattr(self, "reload_raw_button"):
+            raw_selected = bool(self.input_files and is_raw_input_path(self.input_files[0]))
+            self.reload_raw_button.configure(state=tk.NORMAL if raw_selected else tk.DISABLED)
         if hasattr(self, "raw_fields"):
             if enabled:
                 self.raw_fields.pack(fill=tk.X)
@@ -1207,7 +1254,7 @@ class MtfMapperGui(tk.Tk):
         self.input_label.config(text=f"Input: {len(self.input_files)} file(s)" if self.input_files else "Input: none")
         self.output_label.config(text=f"Output: {short_path(self.current_output_root)}")
         if self.input_files:
-            self.set_preview_sources(self.input_files[0], None, [])
+            self.reload_original_preview(show_errors=False)
         self.update_workflow_actions()
         self.status.set("Project loaded")
 
@@ -1334,7 +1381,9 @@ class MtfMapperGui(tk.Tk):
                     self.status.set("Check Raw import settings" if raw_input_failed else "Analysis failed")
                     self.summary_title.set(f"{error.input_path.name} - analysis failed")
                     if raw_input_failed:
-                        self.summary_detail.set("Check the Raw import metadata in Advanced, then run analysis again.")
+                        self.summary_detail.set(
+                            "Check Raw import metadata in Advanced, reload the image, then run analysis again."
+                        )
                     else:
                         self.summary_detail.set("The original image is still available. Adjust the settings and run again.")
                     self.summary_edges.set("-")
@@ -1457,6 +1506,8 @@ class MtfMapperGui(tk.Tk):
         self.result_measurements.clear()
         self.clear_preview("Open an image to run analysis")
         self.preview_image = None
+        self.preview_rgb = None
+        self.preview_rgb_path = None
         self.preview_state = None
         self.preview_path = None
         self.preview_measurements = []
@@ -1525,7 +1576,10 @@ class MtfMapperGui(tk.Tk):
         )
 
     def calculate_fit_scale(self, path: Path) -> float:
-        image_width, image_height = image_size_from_cv(path)
+        if self.preview_rgb_path == path and self.preview_rgb is not None:
+            image_height, image_width = self.preview_rgb.shape[:2]
+        else:
+            image_width, image_height = image_size_from_cv(path)
         canvas_width = max(self.preview.winfo_width() - 18, 320)
         canvas_height = max(self.preview.winfo_height() - 18, 220)
         return max(0.05, min(canvas_width / image_width, canvas_height / image_height, 1.0))
@@ -1538,6 +1592,8 @@ class MtfMapperGui(tk.Tk):
         preferred_mode: str = "Original",
         heatmap_path: Path | None = None,
     ) -> None:
+        self.preview_rgb = None
+        self.preview_rgb_path = None
         self.original_preview_path = original_path
         self.annotated_preview_path = annotated_path
         self.annotated_preview_measurements = measurements
@@ -1583,11 +1639,17 @@ class MtfMapperGui(tk.Tk):
             self.show_image(self.original_preview_path, [])
 
     def show_image(self, path: Path, measurements: list[mtf_mapper_py.EdgeMeasurement] | None = None) -> None:
+        self.cancel_pending_preview_zoom()
         self.preview_path = path
         self.preview_measurements = measurements or []
         try:
+            if self.preview_rgb_path != path or self.preview_rgb is None:
+                self.preview_rgb = rgb_image_from_cv(path)
+                self.preview_rgb_path = path
             self.preview_fit_scale = self.calculate_fit_scale(path)
         except ValueError:
+            self.preview_rgb = None
+            self.preview_rgb_path = None
             self.preview_fit_scale = 1.0
         self.preview_zoom = self.preview_fit_scale
         self.render_preview(reset_view=True)
@@ -1597,9 +1659,11 @@ class MtfMapperGui(tk.Tk):
             self.clear_preview("Open an image to run analysis")
             return
         try:
-            image, image_width, image_height, display_width, display_height = photo_image_from_cv(
-                self.preview_path,
-                self.preview_zoom,
+            if self.preview_rgb_path != self.preview_path or self.preview_rgb is None:
+                self.preview_rgb = rgb_image_from_cv(self.preview_path)
+                self.preview_rgb_path = self.preview_path
+            image, image_width, image_height, display_width, display_height = photo_image_from_rgb(
+                self.preview_rgb, self.preview_zoom
             )
             self.preview_image = image
             canvas_width = max(self.preview.winfo_width(), 1)
@@ -1658,11 +1722,14 @@ class MtfMapperGui(tk.Tk):
             self.clear_preview(f"Cannot preview {self.preview_path.name}")
             self.log(str(exc))
             self.preview_image = None
+            self.preview_rgb = None
+            self.preview_rgb_path = None
             self.preview_state = None
 
     def fit_preview(self) -> None:
         if self.preview_path is None:
             return
+        self.cancel_pending_preview_zoom()
         self.preview_fit_scale = self.calculate_fit_scale(self.preview_path)
         self.preview_zoom = self.preview_fit_scale
         self.render_preview(reset_view=True)
@@ -1694,17 +1761,49 @@ class MtfMapperGui(tk.Tk):
             self.preview.xview_moveto(max(0.0, (target_x - anchor_x) / region_width))
             self.preview.yview_moveto(max(0.0, (target_y - anchor_y) / region_height))
 
+    def schedule_preview_zoom(self, factor: float, anchor_x: int, anchor_y: int) -> None:
+        self.pending_zoom_factor *= factor
+        self.pending_zoom_anchor = (anchor_x, anchor_y)
+        if self.pending_zoom_after is not None:
+            self.after_cancel(self.pending_zoom_after)
+        self.pending_zoom_after = self.after(35, self.apply_pending_preview_zoom)
+
+    def cancel_pending_preview_zoom(self) -> None:
+        if self.pending_zoom_after is not None:
+            self.after_cancel(self.pending_zoom_after)
+        self.pending_zoom_factor = 1.0
+        self.pending_zoom_anchor = None
+        self.pending_zoom_after = None
+
+    def schedule_center_zoom(self, factor: float) -> None:
+        self.schedule_preview_zoom(factor, self.preview.winfo_width() // 2, self.preview.winfo_height() // 2)
+
+    def apply_pending_preview_zoom(self) -> None:
+        factor = self.pending_zoom_factor
+        anchor = self.pending_zoom_anchor
+        self.pending_zoom_factor = 1.0
+        self.pending_zoom_anchor = None
+        self.pending_zoom_after = None
+        if anchor is not None:
+            self.zoom_preview(factor, anchor[0], anchor[1])
+
     def on_preview_wheel(self, event: tk.Event) -> None:
         if self.preview_path is None:
             return
-        self.zoom_preview(wheel_zoom_factor(float(event.delta)), event.x, event.y)
+        self.schedule_preview_zoom(wheel_zoom_factor(float(event.delta)), event.x, event.y)
 
     def on_preview_magnify(self, event: tk.Event) -> None:
         if self.preview_path is None:
             return
-        self.zoom_preview(magnify_zoom_factor(float(event.delta)), event.x, event.y)
+        self.schedule_preview_zoom(magnify_zoom_factor(float(event.delta)), event.x, event.y)
 
     def on_preview_configure(self, _event: tk.Event) -> None:
+        if self.pending_render_after is not None:
+            self.after_cancel(self.pending_render_after)
+        self.pending_render_after = self.after(60, self.apply_pending_preview_render)
+
+    def apply_pending_preview_render(self) -> None:
+        self.pending_render_after = None
         if self.preview_path is None:
             self.clear_preview("Open an image to run analysis")
         else:
@@ -1759,6 +1858,8 @@ class MtfMapperGui(tk.Tk):
         if self.detection_preview_path is None:
             return
         mtf_mapper_py.cv2.imwrite(str(self.detection_preview_path), preview)
+        self.preview_rgb = None
+        self.preview_rgb_path = None
         self.show_image(self.detection_preview_path, [])
 
     def on_preview_click(self, event: tk.Event) -> None:
