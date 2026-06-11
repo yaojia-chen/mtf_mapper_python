@@ -75,6 +75,7 @@ class MtfMapperPyTests(unittest.TestCase):
                 "raw_white_level": "",
                 "exclude_small_fiducials": True,
                 "fiducial_max_area_percent": 15.0,
+                "annotation_labels": "Markers only",
             },
         )
         self.assertEqual(args.input_image, "input.raw")
@@ -94,6 +95,7 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertEqual(args.threshold_mode, "adaptive")
         self.assertEqual(args.roi_radius, 18.0)
         self.assertEqual(args.esf_method, "auto")
+        self.assertEqual(args.annotation_labels, "Markers only")
         self.assertEqual(
             mtf_mapper_gui.normalize_threshold_mode("Hybrid (adaptive + global)"),
             "hybrid",
@@ -553,6 +555,27 @@ class MtfMapperPyTests(unittest.TestCase):
         base = mtf_mapper_py.luminance_to_bgr(lum)
         changed = np.any(annotated != base, axis=2)
         self.assertLess(int(np.count_nonzero(changed)), lum.size // 5)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_marker_only_annotation_reduces_visual_clutter(self):
+        lum = np.full((300, 400), 0.5, dtype=np.float64)
+        measurement = mtf_mapper_py.EdgeMeasurement(
+            1, 200.0, 150.0, 0.586, "mtf_ny4", "mtf_ny4", 0.0, 0.0, 0.0, 0.0, np.array([1.0]), 1.0
+        )
+        base = mtf_mapper_py.luminance_to_bgr(lum)
+        full = mtf_mapper_py.make_annotation(lum, lum, [measurement], "All values")
+        markers = mtf_mapper_py.make_annotation(lum, lum, [measurement], "Markers only")
+        full_changed = np.count_nonzero(np.any(full != base, axis=2))
+        marker_changed = np.count_nonzero(np.any(markers != base, axis=2))
+        self.assertLess(marker_changed, full_changed)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_detection_preview_emphasizes_selected_target(self):
+        lum = np.full((200, 300), 0.8, dtype=np.float64)
+        box = np.array([[80, 60], [220, 60], [220, 140], [80, 140]], dtype=np.float64)
+        normal = mtf_mapper_py.make_detection_preview(lum, lum, [box])
+        selected = mtf_mapper_py.make_detection_preview(lum, lum, [box], selected_block=1)
+        self.assertGreater(np.count_nonzero(normal != selected), 0)
 
     @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
     def test_tiny_heatmap_does_not_crash(self):

@@ -963,11 +963,11 @@ def measure_image(args: argparse.Namespace) -> tuple[np.ndarray, list[EdgeMeasur
 
 
 def annotation_style(shape: tuple[int, ...]) -> tuple[int, int, int, float, int, int, int, int]:
-    scale = float(np.clip(min(shape[:2]) / 800.0, 0.25, 3.0))
+    scale = float(np.clip(min(shape[:2]) / 800.0, 0.25, 1.7))
     outer_radius = max(2, int(round(6 * scale)))
     middle_radius = max(1, int(round(4 * scale)))
     inner_radius = max(1, int(round(3 * scale)))
-    font_scale = max(0.14, 0.52 * scale)
+    font_scale = float(np.clip(0.48 * scale, 0.14, 0.72))
     white_thickness = max(1, int(round(6 * scale)))
     black_thickness = max(1, int(round(4 * scale)))
     color_thickness = max(1, int(round(2 * scale)))
@@ -984,7 +984,12 @@ def annotation_style(shape: tuple[int, ...]) -> tuple[int, int, int, float, int,
     )
 
 
-def make_annotation(lum: np.ndarray, original: np.ndarray, measurements: Sequence[EdgeMeasurement]) -> np.ndarray:
+def make_annotation(
+    lum: np.ndarray,
+    original: np.ndarray,
+    measurements: Sequence[EdgeMeasurement],
+    label_mode: str = "All values",
+) -> np.ndarray:
     require_cv2()
     if original.ndim == 2:
         annotated = luminance_to_bgr(lum)
@@ -1005,6 +1010,8 @@ def make_annotation(lum: np.ndarray, original: np.ndarray, measurements: Sequenc
         cv2.circle(annotated, pos, outer_radius, (255, 255, 255), -1, cv2.LINE_AA)
         cv2.circle(annotated, pos, middle_radius, (0, 0, 0), -1, cv2.LINE_AA)
         cv2.circle(annotated, pos, inner_radius, color, -1, cv2.LINE_AA)
+        if label_mode == "Markers only":
+            continue
         (text_width, text_height), baseline = cv2.getTextSize(
             label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color_thickness
         )
@@ -1022,6 +1029,7 @@ def make_detection_preview(
     original: np.ndarray,
     boxes: Sequence[np.ndarray],
     excluded_blocks: Sequence[int] = (),
+    selected_block: int | None = None,
 ) -> np.ndarray:
     require_cv2()
     if original.ndim == 2:
@@ -1032,7 +1040,8 @@ def make_detection_preview(
     for block_id, box in enumerate(boxes, start=1):
         color = (120, 120, 120) if block_id in excluded else (0, 210, 255)
         points = np.round(box).astype(np.int32)
-        cv2.polylines(preview, [points], True, color, 3, cv2.LINE_AA)
+        thickness = 6 if block_id == selected_block else 3
+        cv2.polylines(preview, [points], True, color, thickness, cv2.LINE_AA)
         center = tuple(np.round(box.mean(axis=0)).astype(int))
         label = f"{block_id} excluded" if block_id in excluded else str(block_id)
         cv2.putText(preview, label, center, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)

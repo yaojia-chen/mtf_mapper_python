@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import json
 import logging
 import math
@@ -175,6 +176,7 @@ def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[s
         raw_white_level=values.get("raw_white_level"),
         log_level=str(values.get("log_level", "INFO")),
         auto_tune=bool(values.get("auto_tune", False)),
+        annotation_labels=str(values.get("annotation_labels", "All values")),
         exclude_small_fiducials=bool(values.get("exclude_small_fiducials", False)),
         fiducial_max_area_ratio=float(values.get("fiducial_max_area_percent", 20.0)) / 100.0,
         manual_boxes=values.get("manual_boxes"),
@@ -361,6 +363,26 @@ def draw_curve(canvas: tk.Canvas, measurement: mtf_mapper_py.EdgeMeasurement, cu
         y = y0 - (float(value) - y_min) / (y_max - y_min) * plot_h
         points.extend([x, y])
     canvas.create_line(*points, fill="#0b63ce", width=2, smooth=True)
+    if curve_type == "SFR":
+        if measurement.mtf_column == "mtf50":
+            guide_x = measurement.mtf_value
+            guide_y = 0.5
+            guide_label = f"MTF50 {measurement.mtf_value:.3f}"
+        else:
+            guide_x = 0.25 if measurement.mtf_column == "mtf_ny4" else 0.5
+            guide_y = measurement.mtf_value
+            guide_label = f"{measurement.mtf_column} {measurement.mtf_value:.3f}"
+        if x_min <= guide_x <= x_max:
+            x = x0 + (guide_x - x_min) / max(x_max - x_min, 1e-12) * plot_w
+            canvas.create_line(x, y1, x, y0, fill="#d12b2b", dash=(5, 4))
+        if y_min <= guide_y <= y_max:
+            y = y0 - (guide_y - y_min) / max(y_max - y_min, 1e-12) * plot_h
+            canvas.create_line(x0, y, x1, y, fill="#d12b2b", dash=(5, 4))
+        canvas.create_text(x1 - 6, y1 + 6, text=guide_label, anchor=tk.NE, fill="#a12020")
+        if x_min <= 0.5 <= x_max:
+            nyquist_x = x0 + (0.5 - x_min) / max(x_max - x_min, 1e-12) * plot_w
+            canvas.create_line(nyquist_x, y1, nyquist_x, y0, fill="#777777", dash=(2, 5))
+            canvas.create_text(nyquist_x + 4, y0 - 4, text="Nyquist", anchor=tk.SW, fill="#666666")
     canvas.create_text(width // 2, height - 8, text=x_label, anchor=tk.S, fill="#333333")
     canvas.create_text(14, (y0 + y1) / 2, text=y_label, angle=90, fill="#333333")
     return CurvePlotState(values, x0, y0, x1, y1, y_min, y_max, x_min, x_max, x_unit)
@@ -403,6 +425,7 @@ class MtfMapperGui(tk.Tk):
         self.raw_manual_widgets: list[tk.Widget] = []
         self.current_output_root = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui"
         self.dock_collapsed = False
+        self.selected_detection_block: int | None = None
 
         self._build_vars()
         self._configure_style()
@@ -431,6 +454,7 @@ class MtfMapperGui(tk.Tk):
         self.exclude_small_fiducials = BooleanVar(value=False)
         self.fiducial_max_area_percent = DoubleVar(value=20.0)
         self.quality_filter = StringVar(value="All edges")
+        self.annotation_labels = StringVar(value="All values")
         self.pixelsize = StringVar(value="")
         self.raw = BooleanVar(value=False)
         self.raw_width = StringVar(value="")
@@ -446,6 +470,9 @@ class MtfMapperGui(tk.Tk):
         self.raw_black_level = StringVar(value="")
         self.raw_white_level = StringVar(value="")
         self.status = StringVar(value="Ready")
+        self.workflow_hint = StringVar(value="1. Open an image or try the sample")
+        self.preview_guide = StringVar(value="")
+        self.diagnostics_source = StringVar(value="No diagnostics yet")
         self.summary_title = StringVar(value="No analysis yet")
         self.summary_detail = StringVar(value="Open an image or try the sample chart to see a measurement summary.")
         self.summary_edges = StringVar(value="-")
@@ -469,12 +496,15 @@ class MtfMapperGui(tk.Tk):
         style.configure("SummaryTitle.TLabel", font=("TkDefaultFont", 13, "bold"))
         style.configure("StatValue.TLabel", font=("TkDefaultFont", 14, "bold"))
         style.configure("Primary.TButton", font=("TkDefaultFont", 11, "bold"))
+        style.configure("Section.TLabel", font=("TkDefaultFont", 10, "bold"))
+        style.configure("Guide.TLabel", foreground="#31586d")
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self)
         file_menu = tk.Menu(menubar, tearoff=False)
-        file_menu.add_command(label="Open...", accelerator="Ctrl+O", command=self.open_files)
-        file_menu.add_command(label="Open single edge image...", accelerator="Ctrl+E", command=self.open_single_roi)
+        shortcut = "Cmd" if sys.platform == "darwin" else "Ctrl"
+        file_menu.add_command(label="Open...", accelerator=f"{shortcut}+O", command=self.open_files)
+        file_menu.add_command(label="Open single edge image...", accelerator=f"{shortcut}+E", command=self.open_single_roi)
         file_menu.add_separator()
         file_menu.add_command(label="Choose output directory...", command=self.choose_output_dir)
         file_menu.add_separator()
@@ -483,7 +513,7 @@ class MtfMapperGui(tk.Tk):
         file_menu.add_command(label="Save settings preset...", command=self.save_preset)
         file_menu.add_command(label="Load settings preset...", command=self.load_preset)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", accelerator="Ctrl+Q", command=self.destroy)
+        file_menu.add_command(label="Exit", accelerator=f"{shortcut}+Q", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
@@ -493,6 +523,12 @@ class MtfMapperGui(tk.Tk):
         self.bind("<Control-o>", lambda _event: self.open_files())
         self.bind("<Control-e>", lambda _event: self.open_single_roi())
         self.bind("<Control-q>", lambda _event: self.destroy())
+        self.bind("<Control-r>", lambda _event: self.run_analysis())
+        if sys.platform == "darwin":
+            self.bind("<Command-o>", lambda _event: self.open_files())
+            self.bind("<Command-e>", lambda _event: self.open_single_roi())
+            self.bind("<Command-q>", lambda _event: self.destroy())
+            self.bind("<Command-r>", lambda _event: self.run_analysis())
 
     def _build_layout(self) -> None:
         self._build_toolbar()
@@ -533,20 +569,43 @@ class MtfMapperGui(tk.Tk):
             pass
         self.dock_button.config(text="Show dock" if self.dock_collapsed else "Hide dock")
 
+    def update_workflow_actions(self) -> None:
+        has_input = bool(self.input_files)
+        has_rois = bool(self.manual_boxes)
+        self.preview_detection_button.configure(state=tk.NORMAL if has_input else tk.DISABLED)
+        self.edit_rois_button.configure(state=tk.NORMAL if has_rois else tk.DISABLED)
+        self.run_button.configure(state=tk.NORMAL if has_input else tk.DISABLED)
+        if not has_input:
+            self.workflow_hint.set("1. Open an image or try the sample")
+        elif self.manual_roi_active:
+            included = len(self.manual_boxes) - len(self.excluded_blocks)
+            self.workflow_hint.set(f"2. Detection tuned: {included} target(s) included")
+        elif self.result_measurements:
+            self.workflow_hint.set("Analysis complete. Inspect an edge or tune detection")
+        else:
+            self.workflow_hint.set("2. Preview detection or 3. Run analysis")
+
     def _build_toolbar(self) -> None:
         toolbar = ttk.Frame(self)
         toolbar.pack(fill=tk.X, padx=10, pady=(10, 8))
-        ttk.Button(toolbar, text="Open", command=self.open_files).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Try sample", command=self.open_sample).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(toolbar, text="Output folder", command=self.choose_output_dir).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(toolbar, text="Preview detection", command=self.preview_detection).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(toolbar, text="Edit ROIs", command=self.edit_rois).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(toolbar, text="Settings", command=lambda: self.show_dock_tab(self.setup_tab)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(toolbar, text="1  Open", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="Open image", command=self.open_files).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Try sample", command=self.open_sample).pack(side=tk.LEFT, padx=(6, 14))
+        ttk.Label(toolbar, text="2  Tune", style="Section.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self.preview_detection_button = ttk.Button(toolbar, text="Preview detection", command=self.preview_detection)
+        self.preview_detection_button.pack(side=tk.LEFT)
+        self.edit_rois_button = ttk.Button(toolbar, text="Edit ROIs", command=self.edit_rois)
+        self.edit_rois_button.pack(side=tk.LEFT, padx=(6, 14))
+        ttk.Button(toolbar, text="Settings", command=lambda: self.show_dock_tab(self.setup_tab)).pack(side=tk.LEFT)
         self.dock_button = ttk.Button(toolbar, text="Hide dock", command=self.toggle_dock)
         self.dock_button.pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(toolbar, text="Clear", command=self.clear_results).pack(side=tk.RIGHT)
-        self.run_button = ttk.Button(toolbar, text="Run analysis", command=self.run_analysis, style="Primary.TButton")
+        more_menu = tk.Menu(toolbar, tearoff=False)
+        more_menu.add_command(label="Choose output folder...", command=self.choose_output_dir)
+        more_menu.add_command(label="Clear results", command=self.clear_results)
+        ttk.Menubutton(toolbar, text="More", menu=more_menu).pack(side=tk.RIGHT)
+        self.run_button = ttk.Button(toolbar, text="3  Run analysis", command=self.run_analysis, style="Primary.TButton")
         self.run_button.pack(side=tk.RIGHT, padx=(0, 8))
+        self.update_workflow_actions()
 
     def _build_image_panel(self, parent: ttk.PanedWindow) -> None:
         preview_frame = ttk.LabelFrame(parent, text="Image preview")
@@ -566,6 +625,9 @@ class MtfMapperGui(tk.Tk):
         )
         self.preview_mode_box.pack(side=tk.LEFT)
         ttk.Label(controls, textvariable=self.preview_info, style="Muted.TLabel", anchor=tk.E).pack(side=tk.RIGHT)
+        ttk.Label(preview_frame, textvariable=self.preview_guide, style="Guide.TLabel", anchor=tk.W).pack(
+            fill=tk.X, padx=10, pady=(4, 0)
+        )
 
         canvas_frame = ttk.Frame(preview_frame)
         canvas_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -578,8 +640,12 @@ class MtfMapperGui(tk.Tk):
         self.preview.grid(row=0, column=0, sticky="nsew")
         x_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.preview.xview)
         y_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.preview.yview)
+        self.preview_x_scroll = x_scroll
+        self.preview_y_scroll = y_scroll
         x_scroll.grid(row=1, column=0, sticky="ew")
         y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid_remove()
+        y_scroll.grid_remove()
         self.preview.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
         canvas_frame.columnconfigure(0, weight=1)
         canvas_frame.rowconfigure(0, weight=1)
@@ -599,7 +665,26 @@ class MtfMapperGui(tk.Tk):
         self.setup_tab = ttk.Frame(parent)
         self.advanced_tab = ttk.Frame(parent)
         parent.add(self.setup_tab, text="Setup")
-        parent.add(self.advanced_tab, text="Adv.")
+        parent.add(self.advanced_tab, text="Advanced")
+        advanced_canvas = tk.Canvas(self.advanced_tab, highlightthickness=0, yscrollincrement=20)
+        advanced_scroll = ttk.Scrollbar(self.advanced_tab, orient=tk.VERTICAL, command=advanced_canvas.yview)
+        advanced_canvas.configure(yscrollcommand=advanced_scroll.set)
+        advanced_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        advanced_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        advanced_content = ttk.Frame(advanced_canvas)
+        advanced_window = advanced_canvas.create_window((0, 0), window=advanced_content, anchor=tk.NW)
+        advanced_content.bind(
+            "<Configure>",
+            lambda _event: advanced_canvas.configure(scrollregion=advanced_canvas.bbox("all")),
+        )
+        advanced_canvas.bind(
+            "<Configure>",
+            lambda event: advanced_canvas.itemconfigure(advanced_window, width=event.width),
+        )
+        advanced_canvas.bind(
+            "<MouseWheel>",
+            lambda event: advanced_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units"),
+        )
 
         basic_tab = self.setup_tab
 
@@ -645,8 +730,17 @@ class MtfMapperGui(tk.Tk):
         ttk.Checkbutton(outputs, text="Annotated image", variable=self.annotate).grid(row=0, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(outputs, text="CSV tables", variable=self.edges).grid(row=1, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Checkbutton(outputs, text="MTF heat map", variable=self.heatmap).grid(row=2, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Label(outputs, text="Annotation labels").grid(row=3, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Combobox(
+            outputs,
+            textvariable=self.annotation_labels,
+            values=("All values", "Markers only"),
+            state="readonly",
+            width=16,
+        ).grid(row=3, column=1, sticky="ew", padx=8, pady=3)
+        outputs.columnconfigure(1, weight=1)
 
-        advanced = ttk.LabelFrame(self.advanced_tab, text="Detection and SFR")
+        advanced = ttk.LabelFrame(advanced_content, text="Detection")
         advanced.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(advanced, text="Threshold mode").grid(row=0, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Combobox(
@@ -656,77 +750,83 @@ class MtfMapperGui(tk.Tk):
             state="readonly",
         ).grid(row=0, column=1, sticky="ew", padx=8, pady=3)
         self._labeled_entry(advanced, "Adaptive window", self.threshold_window, 1)
-        ttk.Checkbutton(advanced, text="Extended SFR domain", variable=self.full_sfr).grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
-        ttk.Checkbutton(advanced, text="Reduced SFR smoothing", variable=self.nosmoothing).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
-        ttk.Label(advanced, text="ESF construction").grid(row=4, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Checkbutton(advanced, text="Automatically tune detection", variable=self.auto_tune).grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
+        ttk.Checkbutton(advanced, text="Exclude small fiducials", variable=self.exclude_small_fiducials).grid(
+            row=3, column=0, sticky=tk.W, padx=8, pady=3
+        )
+        fiducial_limit = ttk.Frame(advanced)
+        fiducial_limit.grid(row=3, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Entry(fiducial_limit, textvariable=self.fiducial_max_area_percent, width=7).pack(side=tk.LEFT)
+        ttk.Label(fiducial_limit, text="% of largest").pack(side=tk.LEFT, padx=(4, 0))
+        advanced.columnconfigure(1, weight=1)
+
+        sfr = ttk.LabelFrame(advanced_content, text="SFR and edge quality")
+        sfr.pack(fill=tk.X, pady=(0, 8))
+        ttk.Checkbutton(sfr, text="Extended SFR domain", variable=self.full_sfr).grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
+        ttk.Checkbutton(sfr, text="Reduced SFR smoothing", variable=self.nosmoothing).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
+        ttk.Label(sfr, text="ESF construction").grid(row=2, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Combobox(
-            advanced,
+            sfr,
             textvariable=self.esf_method,
             values=tuple(ESF_METHOD_VALUES),
             state="readonly",
-        ).grid(row=4, column=1, sticky="ew", padx=8, pady=3)
-        ttk.Checkbutton(advanced, text="Automatically tune detection", variable=self.auto_tune).grid(row=5, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
-        ttk.Checkbutton(advanced, text="Exclude small fiducials", variable=self.exclude_small_fiducials).grid(
-            row=6, column=0, sticky=tk.W, padx=8, pady=3
-        )
-        fiducial_limit = ttk.Frame(advanced)
-        fiducial_limit.grid(row=6, column=1, sticky="ew", padx=8, pady=3)
-        ttk.Entry(fiducial_limit, textvariable=self.fiducial_max_area_percent, width=7).pack(side=tk.LEFT)
-        ttk.Label(fiducial_limit, text="% of largest").pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(advanced, text="Quality filter").grid(row=7, column=0, sticky=tk.W, padx=8, pady=3)
+        ).grid(row=2, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Label(sfr, text="Quality filter").grid(row=3, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Combobox(
-            advanced,
+            sfr,
             textvariable=self.quality_filter,
             values=("All edges", "Good only", "Good + Review"),
             state="readonly",
-        ).grid(row=7, column=1, sticky="ew", padx=8, pady=3)
-        advanced.columnconfigure(1, weight=1)
+        ).grid(row=3, column=1, sticky="ew", padx=8, pady=3)
+        sfr.columnconfigure(1, weight=1)
 
-        raw = ttk.LabelFrame(self.advanced_tab, text="Raw import")
+        raw = ttk.LabelFrame(advanced_content, text="Raw import")
         raw.pack(fill=tk.X)
         raw_enable = ttk.Checkbutton(raw, text="Read as raw pixel stream", variable=self.raw)
-        raw_enable.grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
-        self._labeled_entry(raw, "Width", self.raw_width, 1, store=self.raw_widgets)
-        self._labeled_entry(raw, "Height", self.raw_height, 2, store=self.raw_widgets)
-        dtype_label = ttk.Label(raw, text="Data type")
-        dtype_label.grid(row=3, column=0, sticky=tk.W, padx=8, pady=3)
-        dtype_box = ttk.Combobox(raw, textvariable=self.raw_dtype, values=("uint8", "uint16", "int16", "float32", "float64"), state="readonly")
-        dtype_box.grid(row=3, column=1, sticky="ew", padx=8, pady=3)
-        order_label = ttk.Label(raw, text="Byte order")
-        order_label.grid(row=4, column=0, sticky=tk.W, padx=8, pady=3)
-        order_box = ttk.Combobox(raw, textvariable=self.raw_byte_order, values=("little", "big", "native"), state="readonly")
-        order_box.grid(row=4, column=1, sticky="ew", padx=8, pady=3)
+        raw_enable.pack(anchor=tk.W, padx=8, pady=4)
+        self.raw_fields = ttk.Frame(raw)
+        self.raw_fields.pack(fill=tk.X)
+        self._labeled_entry(self.raw_fields, "Width", self.raw_width, 0, store=self.raw_widgets)
+        self._labeled_entry(self.raw_fields, "Height", self.raw_height, 1, store=self.raw_widgets)
+        dtype_label = ttk.Label(self.raw_fields, text="Data type")
+        dtype_label.grid(row=2, column=0, sticky=tk.W, padx=8, pady=3)
+        dtype_box = ttk.Combobox(self.raw_fields, textvariable=self.raw_dtype, values=("uint8", "uint16", "int16", "float32", "float64"), state="readonly")
+        dtype_box.grid(row=2, column=1, sticky="ew", padx=8, pady=3)
+        order_label = ttk.Label(self.raw_fields, text="Byte order")
+        order_label.grid(row=3, column=0, sticky=tk.W, padx=8, pady=3)
+        order_box = ttk.Combobox(self.raw_fields, textvariable=self.raw_byte_order, values=("little", "big", "native"), state="readonly")
+        order_box.grid(row=3, column=1, sticky="ew", padx=8, pady=3)
         self.raw_widgets.extend([dtype_label, dtype_box, order_label, order_box])
-        self._labeled_entry(raw, "Header bytes", self.raw_header, 5, store=self.raw_widgets)
-        self._labeled_entry(raw, "Channels", self.raw_channels, 6, store=self.raw_widgets)
-        channel_order_label = ttk.Label(raw, text="Channel order")
-        channel_order_label.grid(row=7, column=0, sticky=tk.W, padx=8, pady=3)
+        self._labeled_entry(self.raw_fields, "Header bytes", self.raw_header, 4, store=self.raw_widgets)
+        self._labeled_entry(self.raw_fields, "Channels", self.raw_channels, 5, store=self.raw_widgets)
+        channel_order_label = ttk.Label(self.raw_fields, text="Channel order")
+        channel_order_label.grid(row=6, column=0, sticky=tk.W, padx=8, pady=3)
         channel_order_box = ttk.Combobox(
-            raw, textvariable=self.raw_channel_order, values=("rgb", "bgr"), state="readonly"
+            self.raw_fields, textvariable=self.raw_channel_order, values=("rgb", "bgr"), state="readonly"
         )
-        channel_order_box.grid(row=7, column=1, sticky="ew", padx=8, pady=3)
+        channel_order_box.grid(row=6, column=1, sticky="ew", padx=8, pady=3)
         self.raw_widgets.extend([channel_order_label, channel_order_box])
-        levels_label = ttk.Label(raw, text="Levels")
-        levels_label.grid(row=8, column=0, sticky=tk.W, padx=8, pady=3)
+        levels_label = ttk.Label(self.raw_fields, text="Levels")
+        levels_label.grid(row=7, column=0, sticky=tk.W, padx=8, pady=3)
         levels_box = ttk.Combobox(
-            raw, textvariable=self.raw_normalization, values=tuple(RAW_NORMALIZATION_VALUES), state="readonly"
+            self.raw_fields, textvariable=self.raw_normalization, values=tuple(RAW_NORMALIZATION_VALUES), state="readonly"
         )
-        levels_box.grid(row=8, column=1, sticky="ew", padx=8, pady=3)
+        levels_box.grid(row=7, column=1, sticky="ew", padx=8, pady=3)
         self.raw_widgets.extend([levels_label, levels_box])
-        depth_label = ttk.Label(raw, text="Bit depth")
-        depth_label.grid(row=9, column=0, sticky=tk.W, padx=8, pady=3)
-        depth_box = ttk.Combobox(raw, textvariable=self.raw_bit_depth, values=(8, 10, 12, 14, 16), state="readonly")
-        depth_box.grid(row=9, column=1, sticky="ew", padx=8, pady=3)
-        align_label = ttk.Label(raw, text="Alignment")
-        align_label.grid(row=10, column=0, sticky=tk.W, padx=8, pady=3)
-        align_box = ttk.Combobox(raw, textvariable=self.raw_alignment, values=("right", "left"), state="readonly")
-        align_box.grid(row=10, column=1, sticky="ew", padx=8, pady=3)
+        depth_label = ttk.Label(self.raw_fields, text="Bit depth")
+        depth_label.grid(row=8, column=0, sticky=tk.W, padx=8, pady=3)
+        depth_box = ttk.Combobox(self.raw_fields, textvariable=self.raw_bit_depth, values=(8, 10, 12, 14, 16), state="readonly")
+        depth_box.grid(row=8, column=1, sticky="ew", padx=8, pady=3)
+        align_label = ttk.Label(self.raw_fields, text="Alignment")
+        align_label.grid(row=9, column=0, sticky=tk.W, padx=8, pady=3)
+        align_box = ttk.Combobox(self.raw_fields, textvariable=self.raw_alignment, values=("right", "left"), state="readonly")
+        align_box.grid(row=9, column=1, sticky="ew", padx=8, pady=3)
         self.raw_widgets.extend([depth_label, depth_box, align_label, align_box])
         self.raw_bit_widgets.extend([depth_label, depth_box, align_label, align_box])
-        self._labeled_entry(raw, "Black level", self.raw_black_level, 11, store=self.raw_manual_widgets)
-        self._labeled_entry(raw, "White level", self.raw_white_level, 12, store=self.raw_manual_widgets)
+        self._labeled_entry(self.raw_fields, "Black level", self.raw_black_level, 10, store=self.raw_manual_widgets)
+        self._labeled_entry(self.raw_fields, "White level", self.raw_white_level, 11, store=self.raw_manual_widgets)
         self.raw_widgets.extend(self.raw_manual_widgets)
-        raw.columnconfigure(1, weight=1)
+        self.raw_fields.columnconfigure(1, weight=1)
 
     def _build_bottom_tabs(self, parent: ttk.PanedWindow) -> None:
         self.bottom_tabs = ttk.Notebook(parent)
@@ -773,10 +873,13 @@ class MtfMapperGui(tk.Tk):
         self.bottom_tabs.add(log_tab, text="Log")
 
         diagnostics_tab = ttk.Frame(self.bottom_tabs)
+        ttk.Label(diagnostics_tab, textvariable=self.diagnostics_source, style="SummaryTitle.TLabel").pack(
+            anchor=tk.W, padx=8, pady=(8, 0)
+        )
         self.diagnostics_text = ScrolledText(diagnostics_tab, height=8, wrap=tk.WORD)
         self.diagnostics_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.diagnostics_text.config(state=tk.DISABLED)
-        self.bottom_tabs.add(diagnostics_tab, text="Diag.")
+        self.bottom_tabs.add(diagnostics_tab, text="Diagnostics")
 
     def _summary_stat(self, parent: ttk.Frame, label: str, variable: StringVar, column: int) -> None:
         card = ttk.Frame(parent, padding=(10, 4))
@@ -800,7 +903,7 @@ class MtfMapperGui(tk.Tk):
         if store is not None:
             store.extend([label_widget, entry_widget])
 
-    def open_files(self, auto_run: bool = True) -> None:
+    def open_files(self, auto_run: bool = False) -> None:
         filenames = filedialog.askopenfilenames(title="Select input files", filetypes=SUPPORTED_IMAGE_TYPES)
         if not filenames:
             return
@@ -812,8 +915,9 @@ class MtfMapperGui(tk.Tk):
         self.threshold_preview_path = None
         self.single_roi.set(False)
         self.input_label.config(text=f"Input: {len(self.input_files)} file(s), {self.input_files[0].name}")
-        self.status.set("Image loaded; analysis will start")
+        self.status.set("Image loaded; preview detection or run analysis")
         self.set_preview_sources(self.input_files[0], None, [])
+        self.update_workflow_actions()
         if auto_run:
             self.after(50, self.run_analysis)
 
@@ -840,6 +944,7 @@ class MtfMapperGui(tk.Tk):
         self.status.set("Sample loaded; analysis will start")
         self.log(f"Loaded sample chart: {SAMPLE_CHART}")
         self.set_preview_sources(SAMPLE_CHART, None, [])
+        self.update_workflow_actions()
         self.after(50, self.run_analysis)
 
     def choose_output_dir(self) -> None:
@@ -877,6 +982,7 @@ class MtfMapperGui(tk.Tk):
             self.manual_boxes = boxes
             self.excluded_blocks.clear()
             self.manual_roi_active = True
+            self.selected_detection_block = None
             preview = mtf_mapper_py.make_detection_preview(lum, original, boxes)
             preview_dir = Path(tempfile.gettempdir()) / "mtf_mapper_python_gui_previews" / input_path.stem
             preview_dir.mkdir(parents=True, exist_ok=True)
@@ -888,9 +994,10 @@ class MtfMapperGui(tk.Tk):
             if not mtf_mapper_py.cv2.imwrite(str(self.threshold_preview_path), mask):
                 raise ValueError("Could not create threshold mask preview")
             self.detection_report = report
-            self.set_diagnostics(report, [])
+            self.set_diagnostics(report, [], source="Detection preview")
             self.set_preview_sources(self.original_preview_path or input_path, self.annotated_preview_path, self.annotated_preview_measurements, "Detection", self.heatmap_preview_path)
             self.status.set("Detection preview: click a target to include/exclude it; Shift-drag to add an ROI")
+            self.update_workflow_actions()
         except Exception as exc:
             messagebox.showerror("Detection preview failed", str(exc))
 
@@ -898,6 +1005,9 @@ class MtfMapperGui(tk.Tk):
         if not self.manual_boxes:
             messagebox.showinfo("No ROIs", "Run Preview detection first, or Shift-drag in the detection view to add an ROI.")
             return
+        self.preview_mode.set("Detection")
+        self.selected_detection_block = 1
+        self.refresh_detection_preview()
         dialog = tk.Toplevel(self)
         dialog.title("Edit target ROI")
         dialog.resizable(False, False)
@@ -909,17 +1019,22 @@ class MtfMapperGui(tk.Tk):
         width_value = DoubleVar()
         height_value = DoubleVar()
 
-        ttk.Label(frame, text="Target").grid(row=0, column=0, sticky=tk.W, padx=4, pady=4)
+        ttk.Label(frame, text="Edit the selected detection target. Changes update the preview.", wraplength=290).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, padx=4, pady=(4, 10)
+        )
+        ttk.Label(frame, text="Target").grid(row=1, column=0, sticky=tk.W, padx=4, pady=4)
         selector = ttk.Combobox(frame, textvariable=roi_number, values=tuple(range(1, len(self.manual_boxes) + 1)), state="readonly", width=10)
-        selector.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        selector.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
         for row, (label, variable) in enumerate(
             (("X", x_value), ("Y", y_value), ("Width", width_value), ("Height", height_value)),
-            start=1,
+            start=2,
         ):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, padx=4, pady=4)
             ttk.Entry(frame, textvariable=variable, width=16).grid(row=row, column=1, sticky="ew", padx=4, pady=4)
 
         def load_selected(*_args: object) -> None:
+            self.selected_detection_block = roi_number.get()
+            self.refresh_detection_preview()
             box = self.manual_boxes[roi_number.get() - 1]
             minimum = box.min(axis=0)
             maximum = box.max(axis=0)
@@ -953,16 +1068,27 @@ class MtfMapperGui(tk.Tk):
 
         selector.bind("<<ComboboxSelected>>", load_selected)
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        buttons.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Button(buttons, text="Apply", command=apply_edit).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Delete ROI", command=delete_selected).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
+        def close_dialog() -> None:
+            self.selected_detection_block = None
+            self.refresh_detection_preview()
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Close", command=close_dialog).pack(side=tk.RIGHT)
         load_selected()
         dialog.transient(self)
         dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
     def _update_raw_controls(self) -> None:
         enabled = self.raw.get()
+        if hasattr(self, "raw_fields"):
+            if enabled:
+                self.raw_fields.pack(fill=tk.X)
+            else:
+                self.raw_fields.pack_forget()
 
         def set_enabled(widget: tk.Widget, active: bool) -> None:
             state = "readonly" if active and isinstance(widget, ttk.Combobox) else tk.NORMAL if active else tk.DISABLED
@@ -987,7 +1113,8 @@ class MtfMapperGui(tk.Tk):
         if not hasattr(self, "log_text"):
             return
         self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, message + "\n")
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"{timestamp}  {message}\n")
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
 
@@ -1012,6 +1139,7 @@ class MtfMapperGui(tk.Tk):
             "exclude_small_fiducials": self.exclude_small_fiducials.get(),
             "fiducial_max_area_percent": self.fiducial_max_area_percent.get(),
             "quality_filter": self.quality_filter.get(),
+            "annotation_labels": self.annotation_labels.get(),
             "pixelsize": self.pixelsize.get(),
             "raw": self.raw.get(),
             "raw_width": self.raw_width.get(),
@@ -1080,6 +1208,7 @@ class MtfMapperGui(tk.Tk):
         self.output_label.config(text=f"Output: {short_path(self.current_output_root)}")
         if self.input_files:
             self.set_preview_sources(self.input_files[0], None, [])
+        self.update_workflow_actions()
         self.status.set("Project loaded")
 
     def run_analysis(self) -> None:
@@ -1149,7 +1278,9 @@ class MtfMapperGui(tk.Tk):
                     measurements = [m for m in measurements if m.quality_label != "Poor"]
                 if not measurements:
                     raise ValueError("All measured edges were removed by the quality filter")
-                annotated = mtf_mapper_py.make_annotation(lum, original_for_detection, measurements)
+                annotated = mtf_mapper_py.make_annotation(
+                    lum, original_for_detection, measurements, str(values.get("annotation_labels", "All values"))
+                )
                 mtf_mapper_py.prepare_output_dir(output_dir, args.annotate, args.edges, args.heatmap)
                 if args.edges:
                     mtf_mapper_py.write_edge_tables(output_dir, measurements)
@@ -1230,6 +1361,7 @@ class MtfMapperGui(tk.Tk):
                     self.progress.stop()
                     self.status.set("Analysis complete")
                     self.log("Analysis complete")
+                    self.update_workflow_actions()
         except queue.Empty:
             pass
         self.after(100, self._poll_worker_queue)
@@ -1259,7 +1391,7 @@ class MtfMapperGui(tk.Tk):
             self.summary_median.set("-")
             self.summary_range.set("-")
         self.show_dock_tab(self.results_tab)
-        self.set_diagnostics(result.detection_report, result.measurements)
+        self.set_diagnostics(result.detection_report, result.measurements, source="Last completed analysis")
         self.set_preview_sources(
             result.original_preview_path,
             result.annotated_preview_path,
@@ -1268,23 +1400,31 @@ class MtfMapperGui(tk.Tk):
             result.heatmap_preview_path,
         )
         self.after(100, self.fit_preview)
+        self.update_workflow_actions()
         self.write_batch_summary()
 
     def set_diagnostics(
         self,
         report: mtf_mapper_py.DetectionReport,
         measurements: list[mtf_mapper_py.EdgeMeasurement],
+        source: str = "Diagnostics",
     ) -> None:
+        self.diagnostics_source.set(source)
         counts = {label: sum(m.quality_label == label for m in measurements) for label in ("Good", "Review", "Poor")}
         lines = [
-            f"Mode: {report.threshold_mode}   Threshold: {report.threshold:.3f}   Window: {report.threshold_window:.3f}",
+            "DETECTION",
+            f"Mode: {report.threshold_mode}",
+            f"Threshold: {report.threshold:.3f}   Adaptive window: {report.threshold_window:.3f}",
             f"Contours: {report.contour_count}   Accepted targets: {report.accepted_count}",
             f"Rejected: {report.rejected_small_area} small, {report.rejected_short_side} short, "
             f"{report.rejected_shape} non-rectangular, {report.rejected_fiducial} fiducial-sized",
+            "",
+            "EDGE QUALITY",
             f"Edge quality: {counts['Good']} good, {counts['Review']} review, {counts['Poor']} poor",
             f"ESF methods: {sum(m.esf_method == 'pixel-binned' for m in measurements)} pixel-binned, "
             f"{sum(m.esf_method == 'interpolated' for m in measurements)} interpolated",
             "",
+            "RECOMMENDATION",
             *report.suggestions(),
         ]
         self.diagnostics_text.config(state=tk.NORMAL)
@@ -1342,7 +1482,10 @@ class MtfMapperGui(tk.Tk):
         self.summary_blocks.set("-")
         self.summary_median.set("-")
         self.summary_range.set("-")
+        self.diagnostics_source.set("No diagnostics yet")
+        self.preview_guide.set("")
         self.log("Results cleared")
+        self.update_workflow_actions()
 
     def on_result_selected(self, _event: tk.Event) -> None:
         selected = self.result_tree.selection()
@@ -1370,6 +1513,8 @@ class MtfMapperGui(tk.Tk):
     def clear_preview(self, text: str) -> None:
         self.preview.delete("all")
         self.preview_info.set("No image")
+        self.preview_x_scroll.grid_remove()
+        self.preview_y_scroll.grid_remove()
         self.preview.configure(scrollregion=(0, 0, max(self.preview.winfo_width(), 320), max(self.preview.winfo_height(), 200)))
         self.preview.create_text(
             max(self.preview.winfo_width() // 2, 160),
@@ -1416,6 +1561,16 @@ class MtfMapperGui(tk.Tk):
 
     def show_preview_mode(self) -> None:
         mode = self.preview_mode.get()
+        if mode == "Detection":
+            self.preview_guide.set(
+                "Cyan = included target. Gray = excluded. Click a target to toggle it; Shift-drag to add an ROI."
+            )
+        elif mode == "Threshold mask":
+            self.preview_guide.set("White regions pass the current dark-object threshold; black regions do not.")
+        elif mode == "Annotated":
+            self.preview_guide.set("Click near an annotated edge to inspect its SFR, ESF, and LSF curves.")
+        else:
+            self.preview_guide.set("")
         if mode == "Annotated" and self.annotated_preview_path is not None:
             self.show_image(self.annotated_preview_path, self.annotated_preview_measurements)
         elif mode == "Spatial map" and self.heatmap_preview_path is not None:
@@ -1482,6 +1637,14 @@ class MtfMapperGui(tk.Tk):
                 width=1,
             )
             self.preview.configure(scrollregion=(0, 0, scroll_width, scroll_height))
+            if display_width <= canvas_width:
+                self.preview_x_scroll.grid_remove()
+            else:
+                self.preview_x_scroll.grid()
+            if display_height <= canvas_height:
+                self.preview_y_scroll.grid_remove()
+            else:
+                self.preview_y_scroll.grid()
             self.draw_selected_edge_highlight()
             if reset_view:
                 self.preview.xview_moveto(0.0)
@@ -1586,7 +1749,13 @@ class MtfMapperGui(tk.Tk):
             return
         args = namespace_from_gui_values(self.input_files[0], self.current_output_root / self.input_files[0].stem, self.current_values())
         lum, original = mtf_mapper_py.load_input_luminance(args)
-        preview = mtf_mapper_py.make_detection_preview(lum, original, self.manual_boxes, sorted(self.excluded_blocks))
+        preview = mtf_mapper_py.make_detection_preview(
+            lum,
+            original,
+            self.manual_boxes,
+            sorted(self.excluded_blocks),
+            self.selected_detection_block,
+        )
         if self.detection_preview_path is None:
             return
         mtf_mapper_py.cv2.imwrite(str(self.detection_preview_path), preview)
@@ -1613,6 +1782,7 @@ class MtfMapperGui(tk.Tk):
             else:
                 self.excluded_blocks.add(block_id)
             self.refresh_detection_preview()
+            self.update_workflow_actions()
             return
         if not state.measurements:
             return
@@ -1667,6 +1837,7 @@ class MtfMapperGui(tk.Tk):
             state="readonly",
             width=6,
         ).pack(side=tk.LEFT)
+        ttk.Button(header, text="Export CSV...", command=self.export_selected_curve).pack(side=tk.LEFT, padx=(8, 0))
 
         self.sfr_canvas = tk.Canvas(
             inspector,
@@ -1678,6 +1849,28 @@ class MtfMapperGui(tk.Tk):
         self.sfr_canvas.bind("<Configure>", lambda _event: self.redraw_selected_curve())
         self.sfr_canvas.bind("<Motion>", self.on_sfr_hover)
         self.sfr_canvas.bind("<Leave>", self.on_sfr_leave)
+
+    def export_selected_curve(self) -> None:
+        measurement = self.selected_measurement
+        if measurement is None:
+            return
+        curve_type = self.curve_type.get()
+        values, x_min, x_max, _x_label, _y_label, x_unit = curve_data(measurement, curve_type)
+        filename = filedialog.asksaveasfilename(
+            title=f"Export {curve_type} curve",
+            defaultextension=".csv",
+            initialfile=f"block_{measurement.block_id}_{curve_type.lower()}.csv",
+            filetypes=[("CSV", "*.csv")],
+            parent=self.edge_inspector,
+        )
+        if not filename:
+            return
+        x_values = np.linspace(x_min, x_max, len(values))
+        with Path(filename).open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
+            writer.writerow([f"x ({x_unit})", curve_type])
+            writer.writerows(zip(x_values, values))
+        self.status.set(f"Exported {curve_type} curve")
 
     def close_edge_inspector(self) -> None:
         if self.edge_inspector is not None and self.edge_inspector.winfo_exists():

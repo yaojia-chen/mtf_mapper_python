@@ -58,9 +58,13 @@ uv run mtf-mapper-gui
 The GUI keeps the original C++ app's basic workflow, organized into a compact
 workspace:
 
-- top toolbar for opening files, loading the sample chart, choosing output, and running analysis
+- staged top toolbar for opening an image, tuning detection, and running analysis
 - full-width image preview as the primary workspace
 - collapsible right dock for setup, advanced settings, results, logs, and diagnostics
+
+Opening an image loads it without immediately starting analysis, leaving time
+to preview detection or adjust settings. The sample chart still runs
+automatically as a quick demonstration.
 
 Use **Settings** to open the Setup dock and **Hide dock** to give the image
 nearly the full window. The divider can also be dragged to choose the preferred
@@ -72,21 +76,28 @@ under the pointer.
 
 Use the preview's View selector to switch between the original and annotated
 image after analysis. The original image remains available when analysis fails.
+Choose **Markers only** under Annotation labels when a dense chart makes the
+numeric overlays distracting. Fit mode hides inactive scrollbars.
 The Measurement section exposes the edge ROI radius, while Advanced offers
 Hybrid, Adaptive only, and Global only target-detection modes.
 Advanced also selects Pixel binning, Automatic fallback, or Interpolated
 profiles for ESF construction. Diagnostics report the method used and flag
-sparse pixel bins or nearly axis-aligned edges.
+sparse pixel bins or nearly axis-aligned edges. Raw import fields stay collapsed
+until raw input is enabled, and the Advanced tab scrolls when the full raw form
+is taller than the dock.
 
 When an annotated image is shown, click near an annotated edge/ROI to open the
 resizable Edge Inspector window. Switch between SFR, ESF, and LSF, then hover
 over the curve to show a dashed vertical readout line with the corresponding
-values. Clicking another edge updates the same inspector window. The selected
-edge remains highlighted in the main preview.
+values. SFR charts show the reported measurement and Nyquist reference, and
+**Export CSV** saves the displayed curve. Clicking another edge updates the same
+inspector window. The selected edge remains highlighted in the main preview.
 
 Use **Preview detection** before analysis to inspect the detected targets.
 Click a target to include or exclude it, or Shift-drag on the image to add a
 rectangular ROI. **Edit ROIs** lets you move, resize, or delete a target.
+The preview guide explains the target colors and interaction, and the ROI
+editor highlights the target being edited.
 Advanced settings can automatically tune detection and filter out low-quality
 edges. Enable **Exclude small fiducials** for a quick relative-area filter;
 preview detection first when the chart intentionally mixes target sizes.
