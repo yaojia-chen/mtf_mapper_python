@@ -45,6 +45,9 @@ Add `--auto-tune` to search the available threshold modes, thresholds, and
 adaptive-window sizes automatically. Every command-line run also writes
 `analysis_diagnostics.json` with detection counts, suggestions, and per-edge
 quality scores.
+For charts with small rectangular alignment fiducials, use
+`--exclude-small-fiducials`. Adjust `--fiducial-max-area-ratio` to exclude
+candidates below that fraction of the largest detected target area.
 
 ## GUI
 
@@ -85,7 +88,9 @@ Use **Preview detection** before analysis to inspect the detected targets.
 Click a target to include or exclude it, or Shift-drag on the image to add a
 rectangular ROI. **Edit ROIs** lets you move, resize, or delete a target.
 Advanced settings can automatically tune detection and filter out low-quality
-edges. The Diagnostics tab explains rejected candidates and suggests
+edges. Enable **Exclude small fiducials** for a quick relative-area filter;
+preview detection first when the chart intentionally mixes target sizes.
+The Diagnostics tab explains rejected candidates and suggests
 adjustments, and the View selector can show the threshold mask.
 
 Enable **MTF heat map** to make a Spatial map view available beside Original
@@ -123,7 +128,8 @@ Raw samples default to robust automatic black/white levels, so 8-, 10-, or
 12-bit values stored in `uint16` usefully fill the detection range. For known
 formats, use `--raw-normalization bit-depth --raw-bit-depth 12` and add
 `--raw-alignment left` when samples occupy the high bits. Manual black and
-white levels and the legacy full-data-type range are also available.
+white levels and the legacy full-data-type range are also available. Color RAW
+streams default to RGB; use `--raw-channel-order bgr` for BGR-interleaved data.
 
 In the GUI, a failed `.raw`, `.bin`, or `.dat` import opens the Advanced tab
 and prompts you to verify the Raw import dimensions, data type, byte order,

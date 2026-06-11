@@ -87,6 +87,8 @@ class DetectionReport:
     rejected_small_area: int = 0
     rejected_short_side: int = 0
     rejected_shape: int = 0
+    rejected_fiducial: int = 0
+    fiducial_filter_ratio: float = 0.0
 
     def suggestions(self) -> list[str]:
         if self.threshold_mode == "manual":
@@ -98,6 +100,11 @@ class DetectionReport:
             suggestions.append("Targets may be too small; use a higher-resolution image or crop closer.")
         if self.rejected_shape:
             suggestions.append("Some candidates were not rectangular; improve target contrast or framing.")
+        if self.rejected_fiducial:
+            suggestions.append(
+                f"Excluded {self.rejected_fiducial} small fiducial candidate(s) below "
+                f"{self.fiducial_filter_ratio:.0%} of the largest target area."
+            )
         if not suggestions and self.accepted_count:
             suggestions.append("Detection looks healthy.")
         return suggestions
@@ -142,7 +149,9 @@ def moving_average(values: np.ndarray, width: int) -> np.ndarray:
     if values.size < width:
         return values
     kernel = np.ones(width, dtype=np.float64) / width
-    return np.convolve(values, kernel, mode="same")
+    radius = width // 2
+    padded = np.pad(values, radius, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
 
 
 def smooth_esf(values: np.ndarray, enabled: bool) -> np.ndarray:
@@ -175,17 +184,20 @@ def load_raw_image(
 ) -> np.ndarray:
     dtype = dtype_for_raw(raw_dtype, byte_order)
     expected_values = width * height * channels
+    expected_bytes = header + expected_values * dtype.itemsize
+    actual_bytes = path.stat().st_size
+    if actual_bytes != expected_bytes:
+        packed_hint = ""
+        if dtype.itemsize == 2 and actual_bytes < expected_bytes:
+            packed_hint = " The stream may use packed 10/12/14-bit encoding and need unpacking before import."
+        relation = "ended early" if actual_bytes < expected_bytes else "contains trailing data"
+        raise ValueError(
+            f"raw input {relation}; expected exactly {expected_bytes} bytes including the {header}-byte header, "
+            f"found {actual_bytes}.{packed_hint}"
+        )
     with path.open("rb") as fin:
         fin.seek(header)
         data = np.fromfile(fin, dtype=dtype, count=expected_values)
-    if data.size != expected_values:
-        packed_hint = ""
-        if dtype.itemsize == 2 and data.size < expected_values:
-            packed_hint = " The stream may use packed 10/12/14-bit encoding and need unpacking before import."
-        raise ValueError(
-            f"raw input ended early; expected {expected_values} values after {header} header bytes, "
-            f"read {data.size}.{packed_hint}"
-        )
     if channels == 1:
         return data.reshape((height, width))
     return data.reshape((height, width, channels))
@@ -243,6 +255,8 @@ def normalize_raw_image(
     finite = np.isfinite(arr)
     if not finite.any():
         raise ValueError("raw image does not contain finite values")
+    if not finite.all():
+        raise ValueError("raw image contains non-finite values")
     observed = arr[finite]
     observed_min = float(np.min(observed))
     observed_max = float(np.max(observed))
@@ -301,11 +315,14 @@ def luminance_from_array(
     invert: bool,
     apply_srgb_for_uint8: bool,
     normalized: bool = False,
+    channel_order: str = "bgr",
 ) -> tuple[np.ndarray, np.ndarray]:
     if img.dtype not in (np.uint8, np.uint16) and not (
         np.issubdtype(img.dtype, np.signedinteger) or np.issubdtype(img.dtype, np.floating)
     ):
         raise ValueError("invalid image type; numeric 8-bit, 16-bit, signed integer, or float images are supported")
+    if channel_order not in ("rgb", "bgr"):
+        raise ValueError("channel order must be rgb or bgr")
 
     original = img.copy()
     arr = img.astype(np.float64) if normalized else normalize_image(img)
@@ -314,8 +331,7 @@ def luminance_from_array(
     else:
         if arr.shape[2] == 4:
             arr = arr[:, :, :3]
-        # OpenCV loads color images as BGR.
-        bgr = arr
+        bgr = arr if channel_order == "bgr" else arr[:, :, ::-1]
         if apply_srgb_for_uint8 and img.dtype == np.uint8 and not linear:
             bgr = srgb_to_linear(bgr)
         lum = 0.0722 * bgr[:, :, 0] + 0.7152 * bgr[:, :, 1] + 0.2126 * bgr[:, :, 2]
@@ -391,8 +407,11 @@ def detect_boxes(
     threshold: float,
     threshold_window: float,
     threshold_mode: str = "hybrid",
+    min_relative_area: float = 0.0,
 ) -> list[np.ndarray]:
-    boxes, _report = detect_boxes_with_diagnostics(lum, threshold, threshold_window, threshold_mode)
+    boxes, _report = detect_boxes_with_diagnostics(
+        lum, threshold, threshold_window, threshold_mode, min_relative_area
+    )
     return boxes
 
 
@@ -401,12 +420,21 @@ def detect_boxes_with_diagnostics(
     threshold: float,
     threshold_window: float,
     threshold_mode: str = "hybrid",
+    min_relative_area: float = 0.0,
 ) -> tuple[list[np.ndarray], DetectionReport]:
     require_cv2()
+    if not 0.0 <= min_relative_area <= 1.0:
+        raise ValueError("relative fiducial area filter must be in the interval [0, 1]")
     mask = threshold_dark_objects(lum, threshold, threshold_window, threshold_mode)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     image_area = lum.shape[0] * lum.shape[1]
-    report = DetectionReport(threshold_mode, threshold, threshold_window, contour_count=len(contours))
+    report = DetectionReport(
+        threshold_mode,
+        threshold,
+        threshold_window,
+        contour_count=len(contours),
+        fiducial_filter_ratio=min_relative_area,
+    )
     boxes: list[np.ndarray] = []
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -424,21 +452,38 @@ def detect_boxes_with_diagnostics(
             LOGGER.warning("skipping low-rectangularity contour with score %.2f", rectangularity)
             continue
         boxes.append(order_box_points(cv2.boxPoints(rect).astype(np.float64)))
+    if boxes and min_relative_area > 0.0:
+        areas = np.array([float(cv2.contourArea(box.astype(np.float32))) for box in boxes])
+        keep = areas >= float(np.max(areas)) * min_relative_area
+        report.rejected_fiducial = int(np.count_nonzero(~keep))
+        boxes = [box for box, accepted in zip(boxes, keep) if accepted]
     boxes.sort(key=lambda box: (box[:, 1].mean(), box[:, 0].mean()))
     report.accepted_count = len(boxes)
     return boxes, report
 
 
-def auto_tune_detection(lum: np.ndarray) -> tuple[list[np.ndarray], DetectionReport]:
+def auto_tune_detection(lum: np.ndarray, min_relative_area: float = 0.0) -> tuple[list[np.ndarray], DetectionReport]:
     candidates: list[tuple[float, list[np.ndarray], DetectionReport]] = []
     for mode in ("hybrid", "adaptive", "global"):
         for threshold in (0.4, 0.5, 0.6, 0.7):
             for window in (0.15, 0.25, 1.0 / 3.0, 0.5):
-                boxes, report = detect_boxes_with_diagnostics(lum, threshold, window, mode)
-                area_score = sum(float(cv2.contourArea(box.astype(np.float32))) for box in boxes)
-                score = len(boxes) * 1000000.0 + area_score - report.rejected_shape * 1000.0
-                candidates.append((score, boxes, report))
+                boxes, report = detect_boxes_with_diagnostics(
+                    lum, threshold, window, mode, min_relative_area
+                )
+                areas = np.array([float(cv2.contourArea(box.astype(np.float32))) for box in boxes])
+                if areas.size:
+                    representative = areas >= max(float(np.max(areas)) * 0.05, float(np.median(areas)) * 0.2)
+                    score_boxes = [box for box, keep in zip(boxes, representative) if keep]
+                    score_areas = areas[representative]
+                    consistency = float(np.min(score_areas) / np.max(score_areas)) if score_areas.size > 1 else 1.0
+                    score = float(np.sum(score_areas)) * (1.0 + math.log1p(len(score_boxes))) * (0.5 + 0.5 * consistency)
+                else:
+                    score_boxes = []
+                    score = 0.0
+                score -= report.rejected_shape * 1000.0
+                candidates.append((score, score_boxes, report))
     _score, boxes, report = max(candidates, key=lambda item: item[0])
+    report.accepted_count = len(boxes)
     return boxes, report
 
 
@@ -461,6 +506,60 @@ def orient_esf(esf: np.ndarray, oversampling: int) -> tuple[np.ndarray, float]:
     if low_mean > high_mean:
         esf = esf[::-1]
     return esf, abs(high_mean - low_mean)
+
+
+def refine_edge_line(
+    lum: np.ndarray,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    search_radius: float = 4.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    tangent = p1 - p0
+    length = float(np.linalg.norm(tangent))
+    if length < 8:
+        return p0, p1
+    tangent /= length
+    normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+    center = (p0 + p1) * 0.5
+    margin = search_radius + 2.0
+    min_x = max(0, int(math.floor(min(p0[0], p1[0]) - margin)))
+    max_x = min(lum.shape[1] - 1, int(math.ceil(max(p0[0], p1[0]) + margin)))
+    min_y = max(0, int(math.floor(min(p0[1], p1[1]) - margin)))
+    max_y = min(lum.shape[0] - 1, int(math.ceil(max(p0[1], p1[1]) + margin)))
+    grid_x, grid_y = np.meshgrid(
+        np.arange(min_x, max_x + 1, dtype=np.float64),
+        np.arange(min_y, max_y + 1, dtype=np.float64),
+    )
+    delta_x = grid_x - center[0]
+    delta_y = grid_y - center[1]
+    along = delta_x * tangent[0] + delta_y * tangent[1]
+    across = delta_x * normal[0] + delta_y * normal[1]
+    selected = (np.abs(along) <= 0.42 * length) & (np.abs(across) <= search_radius)
+    if np.count_nonzero(selected) < 24:
+        return p0, p1
+
+    local_lum = lum[min_y : max_y + 1, min_x : max_x + 1].astype(np.float64)
+    grad_y, grad_x = np.gradient(local_lum)
+    weights = np.abs(grad_x * normal[0] + grad_y * normal[1])
+    local_weights = weights[selected]
+    cutoff = float(np.percentile(local_weights, 70))
+    strong = selected & (weights >= max(cutoff, 1e-6))
+    if np.count_nonzero(strong) < 12:
+        return p0, p1
+    points = np.column_stack((grid_x[strong], grid_y[strong]))
+    point_weights = weights[strong]
+    refined_center = np.average(points, axis=0, weights=point_weights)
+    centered = points - refined_center
+    covariance = (centered * point_weights[:, None]).T @ centered / np.sum(point_weights)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    refined_tangent = eigenvectors[:, int(np.argmax(eigenvalues))]
+    if np.dot(refined_tangent, tangent) < 0:
+        refined_tangent = -refined_tangent
+    angle_error = math.degrees(math.acos(float(np.clip(np.dot(refined_tangent, tangent), -1.0, 1.0))))
+    offset = abs(float(np.dot(refined_center - center, normal)))
+    if angle_error > 2.0 or offset > search_radius:
+        return p0, p1
+    return refined_center - refined_tangent * length * 0.5, refined_center + refined_tangent * length * 0.5
 
 
 def interpolated_esf_from_edge(
@@ -585,14 +684,21 @@ def esf_from_edge(
 def sfr_from_esf(esf: np.ndarray, sample_spacing: float, smooth: bool, full_sfr: bool) -> tuple[np.ndarray, np.ndarray]:
     esf = smooth_esf(esf.astype(np.float64), smooth)
     lsf = np.gradient(esf, sample_spacing)
-    lsf -= np.mean(lsf)
     if lsf.size > 1:
         lsf *= np.hamming(lsf.size)
     response = np.abs(np.fft.rfft(lsf))
-    if response.size == 0 or response[0] == 0:
+    if response.size == 0 or not math.isfinite(float(response[0])) or response[0] <= 1e-12:
         raise ValueError("empty SFR response")
-    sfr = response / response[0]
     freqs = np.fft.rfftfreq(lsf.size, d=sample_spacing)
+    argument = 2.0 * np.pi * freqs * sample_spacing
+    derivative_correction = np.ones_like(argument)
+    nonzero = np.abs(argument) > 1e-12
+    sine = np.sin(argument[nonzero])
+    derivative_correction[nonzero] = np.minimum(
+        np.abs(np.divide(argument[nonzero], sine, out=np.full_like(sine, 10.0), where=np.abs(sine) > 1e-12)),
+        10.0,
+    )
+    sfr = response / response[0] * derivative_correction
     max_freq = 2.0 if full_sfr else 1.0
     keep = freqs <= max_freq
     return freqs[keep], sfr[keep]
@@ -675,6 +781,7 @@ def measure_edge(
     roi_radius: float = 12.0,
     esf_method: str = "pixel-binned",
 ) -> EdgeMeasurement:
+    p0, p1 = refine_edge_line(lum, p0, p1)
     esf_result = create_esf_from_edge(lum, p0, p1, radius=roi_radius, method=esf_method)
     esf = esf_result.values
     spacing = esf_result.sample_spacing
@@ -763,7 +870,12 @@ def load_input_luminance(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarr
             report.alignment or "unknown",
         )
         return luminance_from_array(
-            normalized, linear=True, invert=args.invert, apply_srgb_for_uint8=False, normalized=True
+            normalized,
+            linear=True,
+            invert=args.invert,
+            apply_srgb_for_uint8=False,
+            normalized=True,
+            channel_order=getattr(args, "raw_channel_order", "rgb"),
         )
     return load_luminance(input_path, linear=args.linear, invert=args.invert)
 
@@ -790,25 +902,28 @@ def detect_single_roi_box(
 
 def analyze_image(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[EdgeMeasurement]]:
     lum, original = load_input_luminance(args)
+    min_relative_area = getattr(args, "fiducial_max_area_ratio", 0.0) if getattr(
+        args, "exclude_small_fiducials", False
+    ) else 0.0
     manual_boxes = getattr(args, "manual_boxes", None)
     if manual_boxes is not None:
         boxes = [np.asarray(box, dtype=np.float64) for box in manual_boxes]
     elif getattr(args, "auto_tune", False):
-        boxes, report = auto_tune_detection(lum)
+        boxes, report = auto_tune_detection(lum, min_relative_area)
         args.threshold_mode = report.threshold_mode
         args.threshold = report.threshold
         args.threshold_window = report.threshold_window
     else:
         boxes = [detect_single_roi_box(lum, args.threshold, args.threshold_window, args.threshold_mode)] if args.single_roi else detect_boxes(
-            lum, args.threshold, args.threshold_window, args.threshold_mode
+            lum, args.threshold, args.threshold_window, args.threshold_mode, min_relative_area
         )
     excluded = set(getattr(args, "excluded_blocks", []))
-    boxes = [box for idx, box in enumerate(boxes, start=1) if idx not in excluded]
-    if not boxes:
+    indexed_boxes = [(idx, box) for idx, box in enumerate(boxes, start=1) if idx not in excluded]
+    if not indexed_boxes:
         raise ValueError("no dark rectangular objects found; adjust threshold mode or detection settings")
 
     measurements: list[EdgeMeasurement] = []
-    for block_id, box in enumerate(boxes, start=1):
+    for block_id, box in indexed_boxes:
         for p0, p1, corner in box_edges(box):
             try:
                 measurement = measure_edge(
@@ -847,6 +962,28 @@ def measure_image(args: argparse.Namespace) -> tuple[np.ndarray, list[EdgeMeasur
     return annotated, measurements
 
 
+def annotation_style(shape: tuple[int, ...]) -> tuple[int, int, int, float, int, int, int, int]:
+    scale = float(np.clip(min(shape[:2]) / 800.0, 0.25, 3.0))
+    outer_radius = max(2, int(round(6 * scale)))
+    middle_radius = max(1, int(round(4 * scale)))
+    inner_radius = max(1, int(round(3 * scale)))
+    font_scale = max(0.14, 0.52 * scale)
+    white_thickness = max(1, int(round(6 * scale)))
+    black_thickness = max(1, int(round(4 * scale)))
+    color_thickness = max(1, int(round(2 * scale)))
+    offset = max(2, int(round(7 * scale)))
+    return (
+        outer_radius,
+        middle_radius,
+        inner_radius,
+        font_scale,
+        white_thickness,
+        black_thickness,
+        color_thickness,
+        offset,
+    )
+
+
 def make_annotation(lum: np.ndarray, original: np.ndarray, measurements: Sequence[EdgeMeasurement]) -> np.ndarray:
     require_cv2()
     if original.ndim == 2:
@@ -854,6 +991,10 @@ def make_annotation(lum: np.ndarray, original: np.ndarray, measurements: Sequenc
     else:
         base = display_copy(original[:, :, :3])
         annotated = base.copy()
+    height, width = annotated.shape[:2]
+    outer_radius, middle_radius, inner_radius, font_scale, white_thickness, black_thickness, color_thickness, offset = annotation_style(
+        annotated.shape
+    )
     for m in measurements:
         color = ANNOTATION_COLOR_BGR
         if not math.isfinite(m.mtf_value):
@@ -861,13 +1002,18 @@ def make_annotation(lum: np.ndarray, original: np.ndarray, measurements: Sequenc
         else:
             label = f"{m.mtf_value:.1f}" if m.mtf_value >= 10 else f"{m.mtf_value:.3f}"
         pos = (int(round(m.edge_x)), int(round(m.edge_y)))
-        cv2.circle(annotated, pos, 6, (255, 255, 255), -1, cv2.LINE_AA)
-        cv2.circle(annotated, pos, 4, (0, 0, 0), -1, cv2.LINE_AA)
-        cv2.circle(annotated, pos, 3, color, -1, cv2.LINE_AA)
-        text_pos = (pos[0] + 6, pos[1] - 6)
-        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 6, cv2.LINE_AA)
-        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
+        cv2.circle(annotated, pos, outer_radius, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(annotated, pos, middle_radius, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(annotated, pos, inner_radius, color, -1, cv2.LINE_AA)
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color_thickness
+        )
+        text_x = min(max(pos[0] + offset, 0), max(width - text_width - 1, 0))
+        text_y = min(max(pos[1] - offset, text_height + baseline), max(height - baseline - 1, text_height))
+        text_pos = (text_x, text_y)
+        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), white_thickness, cv2.LINE_AA)
+        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), black_thickness, cv2.LINE_AA)
+        cv2.putText(annotated, label, text_pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, color_thickness, cv2.LINE_AA)
     return annotated
 
 
@@ -1041,15 +1187,15 @@ def make_mtf_heatmap(lum: np.ndarray, measurements: Sequence[EdgeMeasurement]) -
     base = luminance_to_bgr(lum)
     output = cv2.addWeighted(base, 0.28, heat, 0.72, 0.0)
 
-    bar_w = 28
-    margin = 18
-    bar_h = max(80, min(height - 2 * margin, 240))
+    margin = max(2, min(18, min(width, height) // 8))
+    bar_w = max(2, min(28, width - 2 * margin))
+    bar_h = max(2, min(height - 2 * margin, 240))
     x0 = max(width - margin - bar_w, 0)
-    y0 = margin
+    y0 = min(margin, max(height - bar_h, 0))
     gradient = np.linspace(255, 0, bar_h, dtype=np.uint8).reshape(bar_h, 1)
     colorbar = cv2.applyColorMap(np.repeat(gradient, bar_w, axis=1), cv2.COLORMAP_JET)
     output[y0 : y0 + bar_h, x0 : x0 + bar_w] = colorbar
-    cv2.rectangle(output, (x0, y0), (x0 + bar_w, y0 + bar_h), (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.rectangle(output, (x0, y0), (min(x0 + bar_w, width - 1), min(y0 + bar_h, height - 1)), (255, 255, 255), 1, cv2.LINE_AA)
     label_color = (255, 255, 255)
     shadow = (0, 0, 0)
     metric = blocks[0].mtf_column
@@ -1068,6 +1214,20 @@ def write_heatmap(output_dir: Path, lum: np.ndarray, measurements: Sequence[Edge
     heatmap = make_mtf_heatmap(lum, measurements)
     if not cv2.imwrite(str(out_path), heatmap):
         raise ValueError(f"could not write {out_path}")
+
+
+def prepare_output_dir(output_dir: Path, annotate: bool, edges: bool, heatmap: bool) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    enabled = {
+        "annotated.png": annotate,
+        "edge_mtf_values.csv": edges,
+        "edge_sfr_values.csv": edges,
+        "mtf_heatmap.png": heatmap,
+    }
+    for filename, keep in enabled.items():
+        path = output_dir / filename
+        if not keep and path.exists():
+            path.unlink()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1090,6 +1250,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="ESF construction: original-pixel binning, interpolated profiles, or automatic fallback",
     )
     parser.add_argument("--auto-tune", action="store_true", help="search threshold modes and values for the strongest detection")
+    parser.add_argument(
+        "--exclude-small-fiducials",
+        action="store_true",
+        help="exclude detected rectangles much smaller than the largest target",
+    )
+    parser.add_argument(
+        "--fiducial-max-area-ratio",
+        type=float,
+        default=0.2,
+        help="exclude candidates below this fraction of the largest target area",
+    )
     parser.add_argument("-l", "--linear", action="store_true", help="treat 8-bit input as linear")
     parser.add_argument("--invert", action="store_true", help="invert brightness before processing")
     parser.add_argument("--single-roi", action="store_true", help="treat input as a single cropped edge/target")
@@ -1124,6 +1295,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-header", type=int, default=0, help="number of header bytes to skip before pixel data")
     parser.add_argument("--raw-channels", type=int, default=1, choices=[1, 3, 4], help="number of interleaved raw channels")
     parser.add_argument(
+        "--raw-channel-order",
+        default="rgb",
+        choices=["rgb", "bgr"],
+        help="channel order for interleaved color raw streams",
+    )
+    parser.add_argument(
         "--raw-normalization",
         default="auto",
         choices=["auto", "bit-depth", "manual", "dtype-range"],
@@ -1146,6 +1323,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--threshold-window must be in the interval (0, 1]")
     if args.roi_radius < 4.0:
         parser.error("--roi-radius must be at least 4 pixels")
+    if not 0.0 < args.fiducial_max_area_ratio <= 1.0:
+        parser.error("--fiducial-max-area-ratio must be in the interval (0, 1]")
     if not 1.0 <= args.mtf <= 99.0:
         parser.error("--mtf must be in the interval [1, 99]")
     if args.pixelsize is not None and args.pixelsize <= 0:
@@ -1170,6 +1349,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         any(value is not None for value in (args.raw_width, args.raw_height, args.raw_black_level, args.raw_white_level))
         or args.raw_header != 0
         or args.raw_channels != 1
+        or args.raw_channel_order != "rgb"
         or args.raw_normalization != "auto"
         or args.raw_bit_depth != 16
         or args.raw_alignment != "right"
@@ -1186,16 +1366,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
     try:
         lum_for_detection, _original = load_input_luminance(args)
+        min_relative_area = args.fiducial_max_area_ratio if args.exclude_small_fiducials else 0.0
         if args.auto_tune:
-            _boxes, report = auto_tune_detection(lum_for_detection)
+            _boxes, report = auto_tune_detection(lum_for_detection, min_relative_area)
         elif args.single_roi:
             report = DetectionReport(args.threshold_mode, args.threshold, args.threshold_window, accepted_count=1)
         else:
             _boxes, report = detect_boxes_with_diagnostics(
-                lum_for_detection, args.threshold, args.threshold_window, args.threshold_mode
+                lum_for_detection, args.threshold, args.threshold_window, args.threshold_mode, min_relative_area
             )
         lum, annotated, measurements = analyze_image(args)
         output_dir = Path(args.output_dir)
+        prepare_output_dir(output_dir, args.annotate, args.edges, args.heatmap)
         if args.edges:
             write_edge_tables(output_dir, measurements)
         if args.annotate:

@@ -118,7 +118,7 @@ def raw_import_error_message(path: Path, error: Exception) -> str:
     return (
         f"Could not open {path.name} using the current Raw import settings.\n\n"
         "Check Read as raw pixel stream, Width, Height, Data type, Byte order, "
-        "Header bytes, Channels, and Levels in Advanced > Raw import, then run analysis again. "
+        "Header bytes, Channels, Channel order, and Levels in Advanced > Raw import, then run analysis again. "
         "Packed 10/12/14-bit streams must be unpacked before import.\n\n"
         f"Details: {error}"
     )
@@ -167,6 +167,7 @@ def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[s
         raw_byte_order=str(values.get("raw_byte_order", "little")),
         raw_header=int(values.get("raw_header", 0)),
         raw_channels=int(values.get("raw_channels", 1)),
+        raw_channel_order=str(values.get("raw_channel_order", "rgb")),
         raw_normalization=normalize_raw_normalization(values.get("raw_normalization", "auto")),
         raw_bit_depth=int(values.get("raw_bit_depth", 16)),
         raw_alignment=str(values.get("raw_alignment", "right")),
@@ -174,6 +175,8 @@ def namespace_from_gui_values(input_path: Path, output_dir: Path, values: dict[s
         raw_white_level=values.get("raw_white_level"),
         log_level=str(values.get("log_level", "INFO")),
         auto_tune=bool(values.get("auto_tune", False)),
+        exclude_small_fiducials=bool(values.get("exclude_small_fiducials", False)),
+        fiducial_max_area_ratio=float(values.get("fiducial_max_area_percent", 20.0)) / 100.0,
         manual_boxes=values.get("manual_boxes"),
         excluded_blocks=values.get("excluded_blocks", []),
     )
@@ -425,6 +428,8 @@ class MtfMapperGui(tk.Tk):
         self.full_sfr = BooleanVar(value=False)
         self.nosmoothing = BooleanVar(value=False)
         self.auto_tune = BooleanVar(value=False)
+        self.exclude_small_fiducials = BooleanVar(value=False)
+        self.fiducial_max_area_percent = DoubleVar(value=20.0)
         self.quality_filter = StringVar(value="All edges")
         self.pixelsize = StringVar(value="")
         self.raw = BooleanVar(value=False)
@@ -434,6 +439,7 @@ class MtfMapperGui(tk.Tk):
         self.raw_byte_order = StringVar(value="little")
         self.raw_header = IntVar(value=0)
         self.raw_channels = IntVar(value=1)
+        self.raw_channel_order = StringVar(value="rgb")
         self.raw_normalization = StringVar(value="Auto levels")
         self.raw_bit_depth = IntVar(value=16)
         self.raw_alignment = StringVar(value="right")
@@ -660,13 +666,20 @@ class MtfMapperGui(tk.Tk):
             state="readonly",
         ).grid(row=4, column=1, sticky="ew", padx=8, pady=3)
         ttk.Checkbutton(advanced, text="Automatically tune detection", variable=self.auto_tune).grid(row=5, column=0, columnspan=2, sticky=tk.W, padx=8, pady=3)
-        ttk.Label(advanced, text="Quality filter").grid(row=6, column=0, sticky=tk.W, padx=8, pady=3)
+        ttk.Checkbutton(advanced, text="Exclude small fiducials", variable=self.exclude_small_fiducials).grid(
+            row=6, column=0, sticky=tk.W, padx=8, pady=3
+        )
+        fiducial_limit = ttk.Frame(advanced)
+        fiducial_limit.grid(row=6, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Entry(fiducial_limit, textvariable=self.fiducial_max_area_percent, width=7).pack(side=tk.LEFT)
+        ttk.Label(fiducial_limit, text="% of largest").pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(advanced, text="Quality filter").grid(row=7, column=0, sticky=tk.W, padx=8, pady=3)
         ttk.Combobox(
             advanced,
             textvariable=self.quality_filter,
             values=("All edges", "Good only", "Good + Review"),
             state="readonly",
-        ).grid(row=6, column=1, sticky="ew", padx=8, pady=3)
+        ).grid(row=7, column=1, sticky="ew", padx=8, pady=3)
         advanced.columnconfigure(1, weight=1)
 
         raw = ttk.LabelFrame(self.advanced_tab, text="Raw import")
@@ -686,25 +699,32 @@ class MtfMapperGui(tk.Tk):
         self.raw_widgets.extend([dtype_label, dtype_box, order_label, order_box])
         self._labeled_entry(raw, "Header bytes", self.raw_header, 5, store=self.raw_widgets)
         self._labeled_entry(raw, "Channels", self.raw_channels, 6, store=self.raw_widgets)
+        channel_order_label = ttk.Label(raw, text="Channel order")
+        channel_order_label.grid(row=7, column=0, sticky=tk.W, padx=8, pady=3)
+        channel_order_box = ttk.Combobox(
+            raw, textvariable=self.raw_channel_order, values=("rgb", "bgr"), state="readonly"
+        )
+        channel_order_box.grid(row=7, column=1, sticky="ew", padx=8, pady=3)
+        self.raw_widgets.extend([channel_order_label, channel_order_box])
         levels_label = ttk.Label(raw, text="Levels")
-        levels_label.grid(row=7, column=0, sticky=tk.W, padx=8, pady=3)
+        levels_label.grid(row=8, column=0, sticky=tk.W, padx=8, pady=3)
         levels_box = ttk.Combobox(
             raw, textvariable=self.raw_normalization, values=tuple(RAW_NORMALIZATION_VALUES), state="readonly"
         )
-        levels_box.grid(row=7, column=1, sticky="ew", padx=8, pady=3)
+        levels_box.grid(row=8, column=1, sticky="ew", padx=8, pady=3)
         self.raw_widgets.extend([levels_label, levels_box])
         depth_label = ttk.Label(raw, text="Bit depth")
-        depth_label.grid(row=8, column=0, sticky=tk.W, padx=8, pady=3)
+        depth_label.grid(row=9, column=0, sticky=tk.W, padx=8, pady=3)
         depth_box = ttk.Combobox(raw, textvariable=self.raw_bit_depth, values=(8, 10, 12, 14, 16), state="readonly")
-        depth_box.grid(row=8, column=1, sticky="ew", padx=8, pady=3)
+        depth_box.grid(row=9, column=1, sticky="ew", padx=8, pady=3)
         align_label = ttk.Label(raw, text="Alignment")
-        align_label.grid(row=9, column=0, sticky=tk.W, padx=8, pady=3)
+        align_label.grid(row=10, column=0, sticky=tk.W, padx=8, pady=3)
         align_box = ttk.Combobox(raw, textvariable=self.raw_alignment, values=("right", "left"), state="readonly")
-        align_box.grid(row=9, column=1, sticky="ew", padx=8, pady=3)
+        align_box.grid(row=10, column=1, sticky="ew", padx=8, pady=3)
         self.raw_widgets.extend([depth_label, depth_box, align_label, align_box])
         self.raw_bit_widgets.extend([depth_label, depth_box, align_label, align_box])
-        self._labeled_entry(raw, "Black level", self.raw_black_level, 10, store=self.raw_manual_widgets)
-        self._labeled_entry(raw, "White level", self.raw_white_level, 11, store=self.raw_manual_widgets)
+        self._labeled_entry(raw, "Black level", self.raw_black_level, 11, store=self.raw_manual_widgets)
+        self._labeled_entry(raw, "White level", self.raw_white_level, 12, store=self.raw_manual_widgets)
         self.raw_widgets.extend(self.raw_manual_widgets)
         raw.columnconfigure(1, weight=1)
 
@@ -840,13 +860,19 @@ class MtfMapperGui(tk.Tk):
             args = namespace_from_gui_values(input_path, self.current_output_root / input_path.stem, values)
             lum, original = mtf_mapper_py.load_input_luminance(args)
             if self.auto_tune.get():
-                boxes, report = mtf_mapper_py.auto_tune_detection(lum)
+                boxes, report = mtf_mapper_py.auto_tune_detection(
+                    lum, args.fiducial_max_area_ratio if args.exclude_small_fiducials else 0.0
+                )
                 self.threshold_mode.set(next((label for label, mode in THRESHOLD_MODE_VALUES.items() if mode == report.threshold_mode), report.threshold_mode))
                 self.threshold.set(report.threshold)
                 self.threshold_window.set(report.threshold_window)
             else:
                 boxes, report = mtf_mapper_py.detect_boxes_with_diagnostics(
-                    lum, args.threshold, args.threshold_window, args.threshold_mode
+                    lum,
+                    args.threshold,
+                    args.threshold_window,
+                    args.threshold_mode,
+                    args.fiducial_max_area_ratio if args.exclude_small_fiducials else 0.0,
                 )
             self.manual_boxes = boxes
             self.excluded_blocks.clear()
@@ -983,6 +1009,8 @@ class MtfMapperGui(tk.Tk):
             "full_sfr": self.full_sfr.get(),
             "nosmoothing": self.nosmoothing.get(),
             "auto_tune": self.auto_tune.get(),
+            "exclude_small_fiducials": self.exclude_small_fiducials.get(),
+            "fiducial_max_area_percent": self.fiducial_max_area_percent.get(),
             "quality_filter": self.quality_filter.get(),
             "pixelsize": self.pixelsize.get(),
             "raw": self.raw.get(),
@@ -992,6 +1020,7 @@ class MtfMapperGui(tk.Tk):
             "raw_byte_order": self.raw_byte_order.get(),
             "raw_header": self.raw_header.get(),
             "raw_channels": self.raw_channels.get(),
+            "raw_channel_order": self.raw_channel_order.get(),
             "raw_normalization": self.raw_normalization.get(),
             "raw_bit_depth": self.raw_bit_depth.get(),
             "raw_alignment": self.raw_alignment.get(),
@@ -1063,6 +1092,9 @@ class MtfMapperGui(tk.Tk):
         if self.roi_radius.get() < 4.0:
             messagebox.showwarning("Invalid ROI size", "Edge ROI radius must be at least 4 pixels.")
             return
+        if self.exclude_small_fiducials.get() and not 0.0 < self.fiducial_max_area_percent.get() <= 100.0:
+            messagebox.showwarning("Invalid fiducial filter", "Minimum fiducial area must be between 0 and 100 percent.")
+            return
         self.run_button.config(state=tk.DISABLED)
         self.progress.start(12)
         self.status.set(f"Analyzing {len(self.input_files)} image(s)...")
@@ -1087,14 +1119,27 @@ class MtfMapperGui(tk.Tk):
                 args = namespace_from_gui_values(input_path, output_dir, values)
                 lum_for_detection, original_for_detection = mtf_mapper_py.load_input_luminance(args)
                 if args.manual_boxes is not None:
+                    excluded = set(args.excluded_blocks)
                     report = mtf_mapper_py.DetectionReport(
-                        "manual", args.threshold, args.threshold_window, accepted_count=len(args.manual_boxes)
+                        "manual",
+                        args.threshold,
+                        args.threshold_window,
+                        accepted_count=sum(
+                            block_id not in excluded for block_id in range(1, len(args.manual_boxes) + 1)
+                        ),
                     )
                 elif args.auto_tune:
-                    _boxes, report = mtf_mapper_py.auto_tune_detection(lum_for_detection)
+                    _boxes, report = mtf_mapper_py.auto_tune_detection(
+                        lum_for_detection,
+                        args.fiducial_max_area_ratio if args.exclude_small_fiducials else 0.0,
+                    )
                 else:
                     _boxes, report = mtf_mapper_py.detect_boxes_with_diagnostics(
-                        lum_for_detection, args.threshold, args.threshold_window, args.threshold_mode
+                        lum_for_detection,
+                        args.threshold,
+                        args.threshold_window,
+                        args.threshold_mode,
+                        args.fiducial_max_area_ratio if args.exclude_small_fiducials else 0.0,
                     )
                 lum, annotated, measurements = mtf_mapper_py.analyze_image(args)
                 quality_filter = str(values.get("quality_filter", "All edges"))
@@ -1105,6 +1150,7 @@ class MtfMapperGui(tk.Tk):
                 if not measurements:
                     raise ValueError("All measured edges were removed by the quality filter")
                 annotated = mtf_mapper_py.make_annotation(lum, original_for_detection, measurements)
+                mtf_mapper_py.prepare_output_dir(output_dir, args.annotate, args.edges, args.heatmap)
                 if args.edges:
                     mtf_mapper_py.write_edge_tables(output_dir, measurements)
                 if args.annotate:
@@ -1233,7 +1279,8 @@ class MtfMapperGui(tk.Tk):
         lines = [
             f"Mode: {report.threshold_mode}   Threshold: {report.threshold:.3f}   Window: {report.threshold_window:.3f}",
             f"Contours: {report.contour_count}   Accepted targets: {report.accepted_count}",
-            f"Rejected: {report.rejected_small_area} small, {report.rejected_short_side} short, {report.rejected_shape} non-rectangular",
+            f"Rejected: {report.rejected_small_area} small, {report.rejected_short_side} short, "
+            f"{report.rejected_shape} non-rectangular, {report.rejected_fiducial} fiducial-sized",
             f"Edge quality: {counts['Good']} good, {counts['Review']} review, {counts['Poor']} poor",
             f"ESF methods: {sum(m.esf_method == 'pixel-binned' for m in measurements)} pixel-binned, "
             f"{sum(m.esf_method == 'interpolated' for m in measurements)} interpolated",

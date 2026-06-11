@@ -4,6 +4,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -30,6 +31,8 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertEqual(args.roi_radius, 12.0)
         self.assertEqual(args.esf_method, "pixel-binned")
         self.assertFalse(args.auto_tune)
+        self.assertFalse(args.exclude_small_fiducials)
+        self.assertEqual(args.fiducial_max_area_ratio, 0.2)
         self.assertEqual(args.raw_normalization, "auto")
 
     def test_raw_requires_dimensions(self):
@@ -64,11 +67,14 @@ class MtfMapperPyTests(unittest.TestCase):
                 "raw_byte_order": "big",
                 "raw_header": 4,
                 "raw_channels": 1,
+                "raw_channel_order": "bgr",
                 "raw_normalization": "Bit depth",
                 "raw_bit_depth": 12,
                 "raw_alignment": "right",
                 "raw_black_level": "",
                 "raw_white_level": "",
+                "exclude_small_fiducials": True,
+                "fiducial_max_area_percent": 15.0,
             },
         )
         self.assertEqual(args.input_image, "input.raw")
@@ -79,6 +85,9 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertEqual(args.raw_byte_order, "big")
         self.assertEqual(args.raw_normalization, "bit-depth")
         self.assertEqual(args.raw_bit_depth, 12)
+        self.assertEqual(args.raw_channel_order, "bgr")
+        self.assertTrue(args.exclude_small_fiducials)
+        self.assertEqual(args.fiducial_max_area_ratio, 0.15)
         self.assertIsNone(args.pixelsize)
         self.assertEqual(args.mtf_metric, "mtf_ny4")
         self.assertTrue(args.heatmap)
@@ -192,6 +201,20 @@ class MtfMapperPyTests(unittest.TestCase):
             self.assertEqual(img.shape, (2, 2))
             self.assertEqual(int(img[0, 1]), 256)
 
+    def test_raw_import_rejects_trailing_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_path = Path(tmp) / "oversized.raw"
+            raw_path.write_bytes(np.arange(10, dtype=np.uint16).tobytes())
+            with self.assertRaisesRegex(ValueError, "trailing data"):
+                mtf_mapper_py.load_raw_image(raw_path, 2, 2, "uint16", "native", 0, 1)
+
+    def test_raw_rgb_channel_order_uses_rgb_luminance(self):
+        image = np.array([[[1.0, 0.0, 0.0]]])
+        lum, _original = mtf_mapper_py.luminance_from_array(
+            image, linear=True, invert=False, apply_srgb_for_uint8=False, normalized=True, channel_order="rgb"
+        )
+        self.assertAlmostEqual(float(lum[0, 0]), 0.2126)
+
     def test_raw_bit_depth_normalization_supports_right_and_left_alignment(self):
         right = np.array([0, 1023, 2048, 4095], dtype=np.uint16)
         normalized, report = mtf_mapper_py.normalize_raw_image(right, mode="bit-depth", bit_depth=12)
@@ -217,6 +240,10 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertAlmostEqual(float(normalized[30, 30]), 0.0)
         self.assertEqual(report.effective_bit_depth, 12)
 
+    def test_raw_normalization_rejects_nonfinite_samples(self):
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            mtf_mapper_py.normalize_raw_image(np.array([0.0, 1.0, np.nan]), mode="auto")
+
     def test_sfr_interpolation_on_smooth_edge(self):
         x = np.linspace(-8.0, 8.0, 257)
         esf = 0.5 + 0.5 * np.tanh(x)
@@ -224,6 +251,50 @@ class MtfMapperPyTests(unittest.TestCase):
         mtf50 = mtf_mapper_py.interpolate_mtf(freqs, sfr, 0.5)
         self.assertTrue(math.isfinite(mtf50))
         self.assertGreater(mtf50, 0.0)
+
+    def test_sfr_normalizes_windowed_dc_and_applies_derivative_correction(self):
+        x = np.linspace(-8.0, 8.0, 257)
+        esf = 0.5 + 0.5 * np.tanh(x)
+        spacing = 0.125
+        lsf = np.gradient(esf, spacing)
+        response = np.abs(np.fft.rfft(lsf * np.hamming(lsf.size)))
+        expected_freqs = np.fft.rfftfreq(lsf.size, d=spacing)
+        argument = 2.0 * np.pi * expected_freqs * spacing
+        correction = np.ones_like(argument)
+        correction[1:] = argument[1:] / np.sin(argument[1:])
+        expected = response / response[0] * correction
+        freqs, sfr = mtf_mapper_py.sfr_from_esf(esf, spacing, smooth=False, full_sfr=True)
+        self.assertTrue(np.allclose(sfr, expected[expected_freqs <= 2.0]))
+        self.assertAlmostEqual(float(sfr[0]), 1.0)
+
+    def test_sfr_preserves_lsf_dc_instead_of_subtracting_mean(self):
+        esf = np.linspace(0.0, 1.0, 129)
+        _freqs, sfr = mtf_mapper_py.sfr_from_esf(esf, sample_spacing=0.125, smooth=False, full_sfr=False)
+        self.assertAlmostEqual(float(sfr[0]), 1.0)
+
+    def test_sfr_allows_valid_sharpening_overshoot(self):
+        x = np.linspace(-12.0, 12.0, 193)
+        spacing = float(x[1] - x[0])
+        lsf = np.exp(-(x**2) / (2 * 0.7**2)) - 0.1 * np.exp(-(x**2) / (2 * 2.0**2))
+        esf = np.cumsum(lsf) * spacing
+        esf = (esf - esf[0]) / (esf[-1] - esf[0])
+        _freqs, sfr = mtf_mapper_py.sfr_from_esf(esf, spacing, smooth=False, full_sfr=False)
+        self.assertGreater(float(np.max(sfr)), 1.0)
+
+    def test_sfr_is_stable_when_edge_shifts_within_roi(self):
+        x = np.linspace(-12.0, 12.0, 193)
+        mtf50_values = []
+        for shift in (0.0, 4.0):
+            esf = 0.5 + 0.5 * np.tanh(x - shift)
+            freqs, sfr = mtf_mapper_py.sfr_from_esf(esf, 0.125, smooth=False, full_sfr=False)
+            mtf50_values.append(mtf_mapper_py.interpolate_mtf(freqs, sfr, 0.5))
+        self.assertAlmostEqual(mtf50_values[0], mtf50_values[1], delta=0.005)
+
+    def test_moving_average_preserves_esf_plateaus(self):
+        values = np.concatenate((np.zeros(50), np.ones(50)))
+        smoothed = mtf_mapper_py.moving_average(values, 21)
+        self.assertAlmostEqual(float(smoothed[0]), 0.0)
+        self.assertAlmostEqual(float(smoothed[-1]), 1.0)
 
     @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
     def test_adaptive_only_threshold_recovers_mid_gray_target(self):
@@ -298,6 +369,46 @@ class MtfMapperPyTests(unittest.TestCase):
         tuned_boxes, tuned_report = mtf_mapper_py.auto_tune_detection(lum)
         self.assertGreaterEqual(len(tuned_boxes), 1)
         self.assertIn(tuned_report.threshold_mode, {"hybrid", "adaptive", "global"})
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_relative_area_filter_excludes_small_fiducials(self):
+        cv2 = mtf_mapper_py.cv2
+        lum = np.full((300, 400), 0.9, dtype=np.float64)
+        cv2.rectangle(lum, (100, 90), (220, 190), 0.2, -1)
+        cv2.rectangle(lum, (300, 30), (320, 50), 0.2, -1)
+        unfiltered, _report = mtf_mapper_py.detect_boxes_with_diagnostics(lum, 0.55, 0.3, "global")
+        filtered, report = mtf_mapper_py.detect_boxes_with_diagnostics(lum, 0.55, 0.3, "global", 0.2)
+        self.assertEqual(len(unfiltered), 2)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(report.rejected_fiducial, 1)
+        self.assertEqual(report.fiducial_filter_ratio, 0.2)
+        self.assertTrue(any("fiducial" in suggestion for suggestion in report.suggestions()))
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_auto_tune_rejects_tiny_rectangular_distractors(self):
+        cv2 = mtf_mapper_py.cv2
+        lum = np.full((500, 700), 0.9, dtype=np.float64)
+        cv2.rectangle(lum, (250, 180), (450, 320), 0.2, -1)
+        for x in range(20, 380, 20):
+            cv2.rectangle(lum, (x, 20), (x + 10, 30), 0.1, -1)
+        boxes, report = mtf_mapper_py.auto_tune_detection(lum)
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(report.accepted_count, 1)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_refine_edge_line_follows_actual_transition(self):
+        yy, xx = np.indices((300, 300), dtype=np.float64)
+        actual_angle = 5.0
+        actual_slope = math.tan(math.radians(actual_angle))
+        distance = (xx - 150.0 - actual_slope * (yy - 150.0)) / math.sqrt(1.0 + actual_slope**2)
+        lum = 0.5 + 0.5 * np.tanh(distance)
+        proposed_slope = math.tan(math.radians(5.5))
+        tangent = np.array([proposed_slope, 1.0])
+        tangent /= np.linalg.norm(tangent)
+        p0 = np.array([150.0, 150.0]) - 100.0 * tangent
+        p1 = np.array([150.0, 150.0]) + 100.0 * tangent
+        refined0, refined1 = mtf_mapper_py.refine_edge_line(lum, p0, p1)
+        self.assertAlmostEqual(mtf_mapper_py.folded_edge_angle(refined0, refined1), actual_angle, delta=0.15)
 
     def test_diagnostics_export_includes_quality(self):
         measurement = mtf_mapper_py.EdgeMeasurement(
@@ -422,6 +533,67 @@ class MtfMapperPyTests(unittest.TestCase):
         self.assertAlmostEqual(blocks[0].y, 5.0)
         self.assertAlmostEqual(blocks[0].mtf_value, 0.3)
         self.assertAlmostEqual(blocks[1].mtf_value, 0.8)
+
+    def test_annotation_style_scales_with_image_size(self):
+        small = mtf_mapper_py.annotation_style((100, 100, 3))
+        medium = mtf_mapper_py.annotation_style((800, 800, 3))
+        large = mtf_mapper_py.annotation_style((2400, 2400, 3))
+        self.assertLess(small[0], medium[0])
+        self.assertLess(small[3], medium[3])
+        self.assertLess(medium[0], large[0])
+        self.assertLess(medium[3], large[3])
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_small_image_annotation_remains_compact(self):
+        lum = np.full((80, 100), 0.5, dtype=np.float64)
+        measurement = mtf_mapper_py.EdgeMeasurement(
+            1, 50.0, 40.0, 0.5, "mtf_ny4", "mtf_ny4", 0.0, 0.0, 0.0, 0.0, np.array([1.0]), 1.0
+        )
+        annotated = mtf_mapper_py.make_annotation(lum, lum, [measurement])
+        base = mtf_mapper_py.luminance_to_bgr(lum)
+        changed = np.any(annotated != base, axis=2)
+        self.assertLess(int(np.count_nonzero(changed)), lum.size // 5)
+
+    @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
+    def test_tiny_heatmap_does_not_crash(self):
+        measurement = mtf_mapper_py.EdgeMeasurement(
+            1, 10.0, 10.0, 0.5, "mtf_ny4", "mtf_ny4", 0.0, 0.0, 0.0, 0.0, np.array([1.0]), 1.0
+        )
+        heatmap = mtf_mapper_py.make_mtf_heatmap(np.ones((20, 20)), [measurement])
+        self.assertEqual(heatmap.shape, (20, 20, 3))
+
+    def test_prepare_output_dir_removes_disabled_stale_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            for name in ("annotated.png", "edge_mtf_values.csv", "edge_sfr_values.csv", "mtf_heatmap.png"):
+                (output_dir / name).write_text("stale", encoding="utf-8")
+            mtf_mapper_py.prepare_output_dir(output_dir, annotate=False, edges=False, heatmap=True)
+            self.assertFalse((output_dir / "annotated.png").exists())
+            self.assertFalse((output_dir / "edge_mtf_values.csv").exists())
+            self.assertTrue((output_dir / "mtf_heatmap.png").exists())
+
+    def test_excluded_blocks_keep_original_block_ids(self):
+        boxes = [
+            np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float64),
+            np.array([[20, 0], [30, 0], [30, 10], [20, 10]], dtype=np.float64),
+            np.array([[40, 0], [50, 0], [50, 10], [40, 10]], dtype=np.float64),
+        ]
+        args = mtf_mapper_py.parse_args(["input.png", "out"])
+        args.manual_boxes = boxes
+        args.excluded_blocks = [2]
+
+        def fake_measure(_lum, block_id, p0, p1, corner, **_kwargs):
+            center = (p0 + p1) * 0.5
+            return mtf_mapper_py.EdgeMeasurement(
+                block_id, center[0], center[1], 0.5, "mtf_ny4", "mtf_ny4",
+                corner[0], corner[1], 0.0, 0.0, np.array([1.0]), 1.0,
+            )
+
+        with mock.patch.object(
+            mtf_mapper_py, "load_input_luminance", return_value=(np.ones((60, 60)), np.ones((60, 60)))
+        ), mock.patch.object(mtf_mapper_py, "measure_edge", side_effect=fake_measure):
+            _lum, _annotation, measurements = mtf_mapper_py.analyze_image(args)
+        self.assertEqual({measurement.block_id for measurement in measurements}, {1, 3})
 
     @unittest.skipIf(mtf_mapper_py.cv2 is None, "OpenCV is not installed")
     def test_single_roi_and_pixelsize(self):
