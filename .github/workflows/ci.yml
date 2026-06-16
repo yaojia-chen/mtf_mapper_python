@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    name: Python API and analyzer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python dependencies
+        run: uv sync --dev
+
+      - name: Compile Python modules
+        run: uv run python -m py_compile mtf_mapper_py.py mtf_mapper_api.py
+
+      - name: Run Python tests
+        run: uv run python -m unittest discover -s tests
+
+  frontend:
+    name: React frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      - name: Build frontend
+        run: npm run frontend:build
+
+  tauri-linux:
+    name: Tauri Linux build
+    runs-on: ubuntu-latest
+    needs: [python, frontend]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build Tauri app
+        run: npm run desktop:build
+
+      - name: Upload Linux desktop bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtf-mapper-desktop-linux
+          path: |
+            frontend/src-tauri/target/release/bundle/**/*.deb
+            frontend/src-tauri/target/release/bundle/**/*.AppImage
+            frontend/src-tauri/target/release/bundle/**/*.rpm
+          if-no-files-found: warn

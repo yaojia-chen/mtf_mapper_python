@@ -1,0 +1,12 @@
+{
+  "name": "mtf-mapper-python-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "api": "uv run mtf-mapper-api",
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "desktop:dev": "npm --prefix frontend run desktop:dev",
+    "desktop:build": "npm --prefix frontend run desktop:build"
+  }
+}

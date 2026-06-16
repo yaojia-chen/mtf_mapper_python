@@ -9,7 +9,9 @@ estimation, and the most useful tabular/annotated outputs.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import io
 import json
 import logging
 import math
@@ -38,6 +40,22 @@ MTF_FIXED_FREQUENCIES = {
     "mtf_ny4": MTF_NYQUIST_CP / 4.0,
 }
 ANNOTATION_COLOR_BGR = (255, 0, 255)
+THRESHOLD_MODE_ALIASES = {
+    "Hybrid (adaptive + global)": "hybrid",
+    "Adaptive only": "adaptive",
+    "Global only": "global",
+}
+ESF_METHOD_ALIASES = {
+    "Pixel binning": "pixel-binned",
+    "Auto fallback": "auto",
+    "Interpolated profiles": "interpolated",
+}
+RAW_NORMALIZATION_ALIASES = {
+    "Auto levels": "auto",
+    "Bit depth": "bit-depth",
+    "Manual levels": "manual",
+    "Full dtype range": "dtype-range",
+}
 
 
 @dataclass
@@ -1088,6 +1106,44 @@ def write_edge_tables(output_dir: Path, measurements: Sequence[EdgeMeasurement])
             )
 
 
+def edge_tables_csv(measurements: Sequence[EdgeMeasurement]) -> dict[str, str]:
+    mtf_out = io.StringIO()
+    mtf_writer = csv.writer(mtf_out)
+    metric_column = measurements[0].mtf_column if measurements else "mtf_ny4"
+    mtf_writer.writerow(["block_id", "edge_x", "edge_y", metric_column, "corner_x", "corner_y"])
+    for m in measurements:
+        mtf_writer.writerow(
+            [
+                m.block_id,
+                f"{m.edge_x:.6f}",
+                f"{m.edge_y:.6f}",
+                f"{m.mtf_value:.9g}",
+                f"{m.corner_x:.6f}",
+                f"{m.corner_y:.6f}",
+            ]
+        )
+
+    sfr_out = io.StringIO()
+    sfr_writer = csv.writer(sfr_out)
+    sfr_count = len(measurements[0].sfr) if measurements else 0
+    sfr_writer.writerow(
+        ["block_id", "edge_x", "edge_y", "edge_angle", "radial_angle"]
+        + [f"sfr_{idx:03d}" for idx in range(sfr_count)]
+    )
+    for m in measurements:
+        sfr_writer.writerow(
+            [
+                m.block_id,
+                f"{m.edge_x:.6f}",
+                f"{m.edge_y:.6f}",
+                f"{m.edge_angle:.6f}",
+                f"{m.radial_angle:.6f}",
+            ]
+            + [f"{v:.9g}" for v in m.sfr]
+        )
+    return {"edge_mtf_values.csv": mtf_out.getvalue(), "edge_sfr_values.csv": sfr_out.getvalue()}
+
+
 def write_annotation(output_dir: Path, annotated: np.ndarray) -> None:
     require_cv2()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1103,27 +1159,7 @@ def write_diagnostics(
     raw_report: RawNormalizationReport | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "detection": {
-            **report.__dict__,
-            "suggestions": report.suggestions(),
-        },
-        "edge_quality": [
-            {
-                "block_id": m.block_id,
-                "edge_x": m.edge_x,
-                "edge_y": m.edge_y,
-                "score": m.quality_score,
-                "label": m.quality_label,
-                "notes": list(m.quality_notes),
-                "esf_method": m.esf_method,
-                "bin_occupancy": m.bin_occupancy,
-            }
-            for m in measurements
-        ],
-    }
-    if raw_report is not None:
-        payload["raw_normalization"] = raw_report.__dict__
+    payload = diagnostics_payload(report, measurements, raw_report)
     (output_dir / "analysis_diagnostics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -1223,6 +1259,257 @@ def write_heatmap(output_dir: Path, lum: np.ndarray, measurements: Sequence[Edge
     heatmap = make_mtf_heatmap(lum, measurements)
     if not cv2.imwrite(str(out_path), heatmap):
         raise ValueError(f"could not write {out_path}")
+
+
+def summarize_measurements(measurements: Sequence[EdgeMeasurement]) -> dict[str, float | int]:
+    if not measurements:
+        return {"edges": 0, "blocks": 0, "median": 0.0, "minimum": 0.0, "maximum": 0.0}
+    values = np.array([measurement.mtf_value for measurement in measurements], dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        median = minimum = maximum = float("nan")
+    else:
+        median = float(np.median(finite))
+        minimum = float(np.min(finite))
+        maximum = float(np.max(finite))
+    return {
+        "edges": len(measurements),
+        "blocks": len({measurement.block_id for measurement in measurements}),
+        "median": median,
+        "minimum": minimum,
+        "maximum": maximum,
+    }
+
+
+def json_safe(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return json_safe(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
+
+
+def diagnostics_payload(
+    report: DetectionReport,
+    measurements: Sequence[EdgeMeasurement],
+    raw_report: RawNormalizationReport | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "detection": {
+            **report.__dict__,
+            "suggestions": report.suggestions(),
+        },
+        "edge_quality": [
+            {
+                "block_id": m.block_id,
+                "edge_x": m.edge_x,
+                "edge_y": m.edge_y,
+                "score": m.quality_score,
+                "label": m.quality_label,
+                "notes": list(m.quality_notes),
+                "esf_method": m.esf_method,
+                "bin_occupancy": m.bin_occupancy,
+            }
+            for m in measurements
+        ],
+    }
+    if raw_report is not None:
+        payload["raw_normalization"] = raw_report.__dict__
+    return payload
+
+
+def image_to_data_url(image: np.ndarray, ext: str = ".png") -> str:
+    require_cv2()
+    ok, encoded = cv2.imencode(ext, image)
+    if not ok:
+        raise ValueError("could not encode preview image")
+    data = base64.b64encode(encoded.tobytes()).decode("ascii")
+    return f"data:image/png;base64,{data}"
+
+
+def display_image_from_original(lum: np.ndarray, original: np.ndarray) -> np.ndarray:
+    if original.ndim == 2:
+        return cv2.cvtColor(display_copy(original), cv2.COLOR_GRAY2BGR)
+    return display_copy(original[:, :, :3])
+
+
+def web_options_to_namespace(input_path: str | Path, options: dict[str, object] | None = None) -> argparse.Namespace:
+    values = options or {}
+    raw_enabled = bool(values.get("raw", False))
+    threshold_mode = THRESHOLD_MODE_ALIASES.get(str(values.get("threshold_mode", "hybrid")), str(values.get("threshold_mode", "hybrid")))
+    esf_method = ESF_METHOD_ALIASES.get(str(values.get("esf_method", "pixel-binned")), str(values.get("esf_method", "pixel-binned")))
+    raw_normalization = RAW_NORMALIZATION_ALIASES.get(
+        str(values.get("raw_normalization", "auto")), str(values.get("raw_normalization", "auto"))
+    )
+    fiducial_ratio = (
+        float(values["fiducial_max_area_percent"]) / 100.0
+        if "fiducial_max_area_percent" in values
+        else float(values.get("fiducial_max_area_ratio", 0.2) or 0.2)
+    )
+    args = argparse.Namespace(
+        input_image=str(input_path),
+        output_dir=".",
+        threshold=float(values.get("threshold", 0.55)),
+        threshold_mode=threshold_mode,
+        threshold_window=float(values.get("threshold_window", 1.0 / 3.0)),
+        roi_radius=float(values.get("roi_radius", 12.0)),
+        esf_method=esf_method,
+        linear=bool(values.get("linear", False)),
+        invert=bool(values.get("invert", False)),
+        single_roi=bool(values.get("single_roi", False)),
+        mtf_metric=str(values.get("mtf_metric", "mtf_ny4")),
+        mtf=float(values.get("mtf", 50.0)),
+        annotate=True,
+        edges=True,
+        heatmap=bool(values.get("heatmap", False)),
+        full_sfr=bool(values.get("full_sfr", False)),
+        nosmoothing=bool(values.get("nosmoothing", False)),
+        pixelsize=values.get("pixelsize"),
+        raw=raw_enabled,
+        raw_width=values.get("raw_width"),
+        raw_height=values.get("raw_height"),
+        raw_dtype=str(values.get("raw_dtype", "uint16")),
+        raw_byte_order=str(values.get("raw_byte_order", "little")),
+        raw_header=int(values.get("raw_header", 0) or 0),
+        raw_channels=int(values.get("raw_channels", 1) or 1),
+        raw_channel_order=str(values.get("raw_channel_order", "rgb")),
+        raw_normalization=raw_normalization,
+        raw_bit_depth=int(values.get("raw_bit_depth", 16) or 16),
+        raw_alignment=str(values.get("raw_alignment", "right")),
+        raw_black_level=values.get("raw_black_level"),
+        raw_white_level=values.get("raw_white_level"),
+        auto_tune=bool(values.get("auto_tune", False)),
+        annotation_labels=str(values.get("annotation_labels", "All values")),
+        exclude_small_fiducials=bool(values.get("exclude_small_fiducials", False)),
+        fiducial_max_area_ratio=fiducial_ratio,
+        manual_boxes=values.get("manual_boxes"),
+        excluded_blocks=values.get("excluded_blocks", []),
+    )
+    if args.pixelsize in ("", None):
+        args.pixelsize = None
+    else:
+        args.pixelsize = float(args.pixelsize)
+    if raw_enabled:
+        if args.raw_width in ("", None) or args.raw_height in ("", None):
+            raise ValueError("raw import requires width and height")
+        args.raw_width = int(args.raw_width)
+        args.raw_height = int(args.raw_height)
+        args.raw_black_level = None if args.raw_black_level in ("", None) else float(args.raw_black_level)
+        args.raw_white_level = None if args.raw_white_level in ("", None) else float(args.raw_white_level)
+    return args
+
+
+def web_load_original(input_path: str, options: dict[str, object] | None = None) -> dict[str, object]:
+    args = web_options_to_namespace(input_path, options)
+    lum, original = load_input_luminance(args)
+    image = display_image_from_original(lum, original)
+    return {
+        "image": image_to_data_url(image),
+        "width": int(image.shape[1]),
+        "height": int(image.shape[0]),
+        "raw_normalization": getattr(args, "raw_normalization_report", None).__dict__
+        if hasattr(args, "raw_normalization_report")
+        else None,
+    }
+
+
+def detect_for_args(args: argparse.Namespace, lum: np.ndarray) -> tuple[list[np.ndarray], DetectionReport]:
+    min_relative_area = args.fiducial_max_area_ratio if getattr(args, "exclude_small_fiducials", False) else 0.0
+    manual_boxes = getattr(args, "manual_boxes", None)
+    if manual_boxes is not None:
+        boxes = [np.asarray(box, dtype=np.float64) for box in manual_boxes]
+        report = DetectionReport(args.threshold_mode, args.threshold, args.threshold_window, accepted_count=len(boxes))
+    elif getattr(args, "auto_tune", False):
+        boxes, report = auto_tune_detection(lum, min_relative_area)
+        args.threshold_mode = report.threshold_mode
+        args.threshold = report.threshold
+        args.threshold_window = report.threshold_window
+    elif getattr(args, "single_roi", False):
+        boxes = [detect_single_roi_box(lum, args.threshold, args.threshold_window, args.threshold_mode)]
+        report = DetectionReport(args.threshold_mode, args.threshold, args.threshold_window, accepted_count=1)
+    else:
+        boxes, report = detect_boxes_with_diagnostics(
+            lum, args.threshold, args.threshold_window, args.threshold_mode, min_relative_area
+        )
+    return boxes, report
+
+
+def web_preview_detection(input_path: str, options: dict[str, object] | None = None) -> dict[str, object]:
+    args = web_options_to_namespace(input_path, options)
+    lum, original = load_input_luminance(args)
+    boxes, report = detect_for_args(args, lum)
+    preview = make_detection_preview(lum, original, boxes, getattr(args, "excluded_blocks", []))
+    mask = threshold_dark_objects(lum, report.threshold, report.threshold_window, report.threshold_mode)
+    return {
+        "detection_image": image_to_data_url(preview),
+        "threshold_image": image_to_data_url(mask),
+        "boxes": [box.tolist() for box in boxes],
+        "report": {**report.__dict__, "suggestions": report.suggestions()},
+        "raw_normalization": getattr(args, "raw_normalization_report", None).__dict__
+        if hasattr(args, "raw_normalization_report")
+        else None,
+    }
+
+
+def measurement_to_dict(measurement: EdgeMeasurement) -> dict[str, object]:
+    return {
+        "block_id": measurement.block_id,
+        "edge_x": measurement.edge_x,
+        "edge_y": measurement.edge_y,
+        "mtf_value": measurement.mtf_value,
+        "mtf_metric": measurement.mtf_metric,
+        "mtf_column": measurement.mtf_column,
+        "corner_x": measurement.corner_x,
+        "corner_y": measurement.corner_y,
+        "edge_angle": measurement.edge_angle,
+        "radial_angle": measurement.radial_angle,
+        "quality": measurement.quality,
+        "edge_start_x": measurement.edge_start_x,
+        "edge_start_y": measurement.edge_start_y,
+        "edge_end_x": measurement.edge_end_x,
+        "edge_end_y": measurement.edge_end_y,
+        "sample_spacing": measurement.sample_spacing,
+        "quality_score": measurement.quality_score,
+        "quality_label": measurement.quality_label,
+        "quality_notes": list(measurement.quality_notes),
+        "esf_method": measurement.esf_method,
+        "bin_occupancy": measurement.bin_occupancy,
+        "sfr": measurement.sfr.tolist(),
+        "esf": measurement.esf.tolist(),
+        "lsf": measurement.lsf.tolist(),
+    }
+
+
+def web_analyze(input_path: str, options: dict[str, object] | None = None) -> dict[str, object]:
+    args = web_options_to_namespace(input_path, options)
+    lum_for_detection, _original_for_detection = load_input_luminance(args)
+    _boxes, report = detect_for_args(args, lum_for_detection)
+    lum, annotated, measurements = analyze_image(args)
+    outputs = {
+        "annotated.png": image_to_data_url(annotated),
+        "analysis_diagnostics.json": json.dumps(
+            diagnostics_payload(report, measurements, getattr(args, "raw_normalization_report", None)),
+            indent=2,
+        ),
+        **edge_tables_csv(measurements),
+    }
+    if getattr(args, "heatmap", False):
+        outputs["mtf_heatmap.png"] = image_to_data_url(make_mtf_heatmap(lum, measurements))
+    return {
+        "summary": summarize_measurements(measurements),
+        "measurements": [measurement_to_dict(measurement) for measurement in measurements],
+        "outputs": outputs,
+        "report": {**report.__dict__, "suggestions": report.suggestions()},
+        "raw_normalization": getattr(args, "raw_normalization_report", None).__dict__
+        if hasattr(args, "raw_normalization_report")
+        else None,
+    }
 
 
 def prepare_output_dir(output_dir: Path, annotate: bool, edges: bool, heatmap: bool) -> None:

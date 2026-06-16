@@ -5,24 +5,28 @@ description = "Standalone Python core analyzer inspired by MTF Mapper"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "fastapi",
     "numpy",
     "opencv-python",
+    "python-multipart",
     "scipy",
+    "uvicorn",
 ]
 
 [project.scripts]
 mtf-mapper-py = "mtf_mapper_py:main"
-mtf-mapper-gui = "mtf_mapper_gui:main"
+mtf-mapper-api = "mtf_mapper_api:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["mtf_mapper_py", "mtf_mapper_gui"]
+py-modules = ["mtf_mapper_py", "mtf_mapper_api"]
 
 [dependency-groups]
 dev = [
+    "httpx2",
     "pytest",
 ]
 

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MTF Mapper Desktop",
+  "version": "0.1.0",
+  "identifier": "com.mtfmapper.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "MTF Mapper Desktop",
+        "width": 1440,
+        "height": 950,
+        "minWidth": 1100,
+        "minHeight": 760
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

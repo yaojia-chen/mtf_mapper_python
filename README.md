@@ -49,69 +49,79 @@ For charts with small rectangular alignment fiducials, use
 `--exclude-small-fiducials`. Adjust `--fiducial-max-area-ratio` to exclude
 candidates below that fraction of the largest detected target area.
 
-## GUI
+## Desktop App Stack
 
 ```bash
-uv run mtf-mapper-gui
+uv sync --dev
+cd frontend && npm install
 ```
 
-The GUI keeps the original C++ app's basic workflow, organized into a compact
-workspace:
+The GUI now uses a modern local desktop architecture:
 
-- staged top toolbar for opening an image, tuning detection, and running analysis
-- full-width image preview as the primary workspace
-- collapsible right dock for setup, advanced settings, results, logs, and diagnostics
+- React + TypeScript + Vite for the interface
+- FastAPI for the local analysis service
+- native Python, NumPy, SciPy, and OpenCV for image processing
+- a Tauri scaffold for packaging the frontend as a desktop app
 
-Opening an image loads it without immediately starting analysis, leaving time
-to preview detection or adjust settings. The sample chart still runs
-automatically as a quick demonstration.
-Raw files use the current Raw import metadata to build the original preview.
-After changing that metadata, click **Reload with Raw settings** instead of
-reopening the file.
+During development, run the local API from the repository root in one terminal:
 
-Use **Settings** to open the Setup dock and **Hide dock** to give the image
-nearly the full window. The divider can also be dragged to choose the preferred
-preview-to-dock balance. This side-by-side layout preserves vertical space for
-the common square and 4:3 source-image formats on wide monitors.
-The preview supports smooth mouse-wheel and trackpad zoom, including macOS
-pinch gestures when exposed by the installed Tk version. Zoom stays anchored
-under the pointer. Preview pixels are cached and rapid touchpad events are
-combined to keep large-image zoom responsive.
+```bash
+uv run mtf-mapper-api
+```
 
-Use the preview's View selector to switch between the original and annotated
-image after analysis. The original image remains available when analysis fails.
-Choose **Markers only** under Annotation labels when a dense chart makes the
-numeric overlays distracting. Fit mode hides inactive scrollbars.
-The Measurement section exposes the edge ROI radius, while Advanced offers
-Hybrid, Adaptive only, and Global only target-detection modes.
-Advanced also selects Pixel binning, Automatic fallback, or Interpolated
-profiles for ESF construction. Diagnostics report the method used and flag
-sparse pixel bins or nearly axis-aligned edges. Raw import fields stay collapsed
-until raw input is enabled, and the Advanced tab scrolls when the full raw form
-is taller than the dock.
+Then run the frontend from the repository root in another terminal:
 
-When an annotated image is shown, click near an annotated edge/ROI to open the
-resizable Edge Inspector window. Switch between SFR, ESF, and LSF, then hover
-over the curve to show a dashed vertical readout line with the corresponding
-values. SFR charts show the reported measurement and Nyquist reference, and
-**Export CSV** saves the displayed curve. Clicking another edge updates the same
-inspector window. The selected edge remains highlighted in the main preview.
+```bash
+npm run frontend:dev
+```
 
-Use **Preview detection** before analysis to inspect the detected targets.
-Click a target to include or exclude it, or Shift-drag on the image to add a
-rectangular ROI. **Edit ROIs** lets you move, resize, or delete a target.
-The preview guide explains the target colors and interaction, and the ROI
-editor highlights the target being edited.
-Advanced settings can automatically tune detection and filter out low-quality
-edges. Enable **Exclude small fiducials** for a quick relative-area filter;
-preview detection first when the chart intentionally mixes target sizes.
-The Diagnostics tab explains rejected candidates and suggests
-adjustments, and the View selector can show the threshold mask.
+Open [http://127.0.0.1:1420](http://127.0.0.1:1420).
 
-Enable **MTF heat map** to make a Spatial map view available beside Original
-and Annotated. Opening multiple files produces a `batch_summary.csv` comparison
-in the selected output folder. File menu commands save and load reusable
-settings presets and complete `.mtfproject` sessions.
+The React app keeps the image-first workflow:
+
+- open a standard image and see the original preview immediately
+- use **Preview detection** to inspect detected targets and the threshold mask
+- use **Run analysis** to create annotated, SFR CSV, MTF CSV, diagnostics, and
+  optional spatial-map outputs
+- switch between Original, Detection, Threshold mask, Annotated, and Spatial map
+- inspect SFR, ESF, and LSF curves for measured edges
+- download generated images, CSV files, and diagnostics directly from the page
+
+For `.raw`, `.bin`, and `.dat` files, enable **Read as raw pixel stream**, set
+the Raw import metadata, then click **Reload with Raw settings**. If the current
+metadata is wrong, the app keeps you in the Advanced panel so you can update the
+settings and reload without reopening the file.
+
+To build the frontend:
+
+```bash
+npm run frontend:build
+```
+
+To run the Tauri shell after installing Rust/Cargo:
+
+```bash
+npm run desktop:dev
+```
+
+The current Tauri scaffold opens the React app. The FastAPI service is still run
+as a companion local process in development; bundling and auto-starting that
+process is the next packaging step.
+
+## GitHub Builds
+
+GitHub Actions can compile and verify the app without needing Rust/Cargo on
+your local machine. The workflow in `.github/workflows/ci.yml` runs on pushes
+to `main` and on pull requests. It:
+
+- installs and tests the Python analyzer/API
+- audits and builds the React frontend
+- installs Linux Tauri system dependencies
+- builds the Tauri desktop shell on Ubuntu
+- uploads the Linux desktop bundle as a workflow artifact
+
+The first packaged desktop build is Linux-only. Add macOS and Windows runners
+once the Linux bundle is passing and the Python API packaging strategy is final.
 
 ## Sample Image
 
@@ -146,10 +156,10 @@ formats, use `--raw-normalization bit-depth --raw-bit-depth 12` and add
 white levels and the legacy full-data-type range are also available. Color RAW
 streams default to RGB; use `--raw-channel-order bgr` for BGR-interleaved data.
 
-In the GUI, a failed `.raw`, `.bin`, or `.dat` import opens the Advanced tab
-and prompts you to verify the Raw import dimensions, data type, byte order,
-header bytes, channel count, and level mapping. Packed 10/12/14-bit streams
-must be unpacked before import.
+In the app, a failed `.raw`, `.bin`, or `.dat` import keeps you in the Advanced
+settings area so you can verify the Raw import dimensions, data type, byte
+order, header bytes, channel count, and level mapping. Packed 10/12/14-bit
+streams must be unpacked before import.
 
 ## Test
 
