@@ -116,12 +116,14 @@ to `main` and on pull requests. It:
 
 - installs and tests the Python analyzer/API
 - audits and builds the React frontend
-- installs Linux Tauri system dependencies
-- builds the Tauri desktop shell on Ubuntu
-- uploads the Linux desktop bundle as a workflow artifact
+- installs Linux Tauri system dependencies on Ubuntu
+- builds the Tauri desktop shell on macOS, Windows, and Ubuntu
+- uploads each platform bundle as a workflow artifact
 
-The first packaged desktop build is Linux-only. Add macOS and Windows runners
-once the Linux bundle is passing and the Python API packaging strategy is final.
+Artifacts are named `mtf-mapper-desktop-macos`,
+`mtf-mapper-desktop-windows`, and `mtf-mapper-desktop-ubuntu`. The FastAPI
+service is still run as a companion local process in development; bundling and
+auto-starting that process is the next packaging step.
 
 ## Sample Image
 
